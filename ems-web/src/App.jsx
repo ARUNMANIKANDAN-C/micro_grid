@@ -149,14 +149,25 @@ function App() {
       if (!response.ok) throw new Error('API Request Failed');
       const data = await response.json();
 
+      // Legacy fallback: if the response is in the new decentralized format, map Delhi's data (default single city)
+      const legacyData = data.mpc?.per_city?.delhi ? {
+        action_p_import_kw: data.mpc.per_city.delhi.import_kw,
+        action_p_export_kw: data.mpc.per_city.delhi.export_kw,
+        action_bat_charge_kw: data.mpc.per_city.delhi.charge_kw,
+        action_bat_discharge_kw: data.mpc.per_city.delhi.discharge_kw,
+        action_load_shedding_active: data.city_opt?.delhi?.load_now > data.city_opt?.delhi?.gen_now + 10, // heuristic
+        action_served_load_kw: data.city_opt?.delhi?.load_now ?? load,
+        predicted_operational_cost: data.mpc.total_cost_inr
+      } : data;
+
       setAction({
-        importKw: data.action_p_import_kw,
-        exportKw: data.action_p_export_kw,
-        chargeKw: data.action_bat_charge_kw,
-        dischargeKw: data.action_bat_discharge_kw,
-        loadSheddingActive: data.action_load_shedding_active,
-        servedLoadKw: data.action_served_load_kw,
-        cost: data.predicted_operational_cost,
+        importKw: legacyData.action_p_import_kw ?? 0,
+        exportKw: legacyData.action_p_export_kw ?? 0,
+        chargeKw: legacyData.action_bat_charge_kw ?? 0,
+        dischargeKw: legacyData.action_bat_discharge_kw ?? 0,
+        loadSheddingActive: !!legacyData.action_load_shedding_active,
+        servedLoadKw: legacyData.action_served_load_kw ?? load,
+        cost: legacyData.predicted_operational_cost ?? 0,
         loading: false,
         error: null
       });
@@ -434,7 +445,7 @@ function App() {
                 </div>
                 <div style={{ textAlign: 'right' }}>
                   <div style={{ fontSize: '1.2rem', fontWeight: 700, color: action.loadSheddingActive ? 'var(--accent-orange)' : 'var(--text-main)' }}>
-                    {action.servedLoadKw.toFixed(1)} <span style={{ fontSize: '0.8rem', fontWeight: 400 }}>/ {load.toFixed(1)} kW</span>
+                    {(action.servedLoadKw ?? 0).toFixed(1)} <span style={{ fontSize: '0.8rem', fontWeight: 400 }}>/ {(load ?? 0).toFixed(1)} kW</span>
                   </div>
                   <div style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Load Served</div>
                 </div>
@@ -447,7 +458,7 @@ function App() {
                     <ArrowRightLeft size={20} className="kpi-import" />
                   </div>
                   <div style={{ display: 'flex', alignItems: 'baseline', gap: '4px' }}>
-                    <span className={`kpi-value kpi-import`}>{action.importKw.toFixed(2)}</span>
+                    <span className={`kpi-value kpi-import`}>{(action.importKw ?? 0).toFixed(2)}</span>
                     <span className="kpi-unit">kW</span>
                   </div>
                 </div>
@@ -458,7 +469,7 @@ function App() {
                     <Zap size={20} className="kpi-export" />
                   </div>
                   <div style={{ display: 'flex', alignItems: 'baseline', gap: '4px' }}>
-                    <span className={`kpi-value kpi-export`}>{action.exportKw.toFixed(2)}</span>
+                    <span className={`kpi-value kpi-export`}>{(action.exportKw ?? 0).toFixed(2)}</span>
                     <span className="kpi-unit">kW</span>
                   </div>
                 </div>
@@ -469,7 +480,7 @@ function App() {
                     <BatteryCharging size={20} className="kpi-charge" />
                   </div>
                   <div style={{ display: 'flex', alignItems: 'baseline', gap: '4px' }}>
-                    <span className={`kpi-value kpi-charge`}>{action.chargeKw.toFixed(2)}</span>
+                    <span className={`kpi-value kpi-charge`}>{(action.chargeKw ?? 0).toFixed(2)}</span>
                     <span className="kpi-unit">kW</span>
                   </div>
                 </div>
@@ -480,7 +491,7 @@ function App() {
                     <Battery size={20} className="kpi-discharge" />
                   </div>
                   <div style={{ display: 'flex', alignItems: 'baseline', gap: '4px' }}>
-                    <span className={`kpi-value kpi-discharge`}>{action.dischargeKw.toFixed(2)}</span>
+                    <span className={`kpi-value kpi-discharge`}>{(action.dischargeKw ?? 0).toFixed(2)}</span>
                     <span className="kpi-unit">kW</span>
                   </div>
                 </div>
@@ -510,14 +521,14 @@ function App() {
             const loadBase = [0.12, 0.12, 0.12, 0.15, 0.25, 0.38, 0.55, 0.75, 0.88, 0.94, 1.0, 1.0, 0.94, 0.88, 0.80, 0.70, 0.60, 0.50, 0.42, 0.35, 0.25, 0.18, 0.15, 0.12];
             const priceBase = [0.40, 0.40, 0.40, 0.40, 0.45, 0.55, 0.70, 0.80, 0.90, 0.95, 1.0, 1.0, 0.95, 0.85, 0.75, 0.65, 0.75, 0.90, 1.0, 0.80, 0.60, 0.50, 0.45, 0.40];
 
-            const nowPv = (pv * pvBase[h]).toFixed(1);
-            const baseCurrentLoad = (load * loadBase[h]).toFixed(1);
-            const nowLoad = action.loadSheddingActive ? action.servedLoadKw.toFixed(1) : baseCurrentLoad;
-            const nowPrice = (importPrice * priceBase[h]).toFixed(1);
-            const netPower = (nowPv - nowLoad).toFixed(1);
-            const socPct = ((soc / 47.4) * 100).toFixed(0);
-            const isExporting = netPower > 0;
-            const isBatActive = action.chargeKw > 0.01 || action.dischargeKw > 0.01;
+            const nowPv = (parseFloat(pv || 0) * pvBase[h]).toFixed(1);
+            const baseCurrentLoad = (parseFloat(load || 0) * loadBase[h]).toFixed(1);
+            const nowLoad = action.loadSheddingActive ? (action.servedLoadKw || 0).toFixed(1) : baseCurrentLoad;
+            const nowPrice = (parseFloat(importPrice || 0) * priceBase[h]).toFixed(1);
+            const netPower = (parseFloat(nowPv) - parseFloat(nowLoad)).toFixed(1);
+            const socPct = (((soc || 0) / 47.4) * 100).toFixed(0);
+            const isExporting = parseFloat(netPower) > 0;
+            const isBatActive = (action.chargeKw || 0) > 0.01 || (action.dischargeKw || 0) > 0.01;
 
             let mode = '⏸ Idle';
             let modeColor = 'var(--text-muted)';
@@ -605,7 +616,7 @@ function App() {
                       <Battery size={18} color={socColor} />
                       <span style={{ fontSize: '0.9rem', color: 'var(--text-main)' }}>Battery Health</span>
                     </div>
-                    <span style={{ fontSize: '0.9rem', fontWeight: 600, color: socColor }}>{socPct}% ({soc.toFixed(1)} / 47.4 kWh)</span>
+                    <span style={{ fontSize: '0.9rem', fontWeight: 600, color: socColor }}>{socPct}% ({(soc ?? 0).toFixed(1)} / 47.4 kWh)</span>
                   </div>
                   <div style={{ width: '100%', height: '12px', background: 'rgba(255,255,255,0.08)', borderRadius: '6px', overflow: 'hidden' }}>
                     <div style={{
@@ -618,8 +629,8 @@ function App() {
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '4px' }}>
                     <span>Min (9.5 kWh)</span>
                     <span style={{ color: isBatActive ? modeColor : 'var(--text-muted)', fontWeight: isBatActive ? 600 : 400 }}>
-                      {action.chargeKw > 0.01 ? `⚡ Charging at ${action.chargeKw.toFixed(1)} kW` :
-                        action.dischargeKw > 0.01 ? `🔋 Discharging at ${action.dischargeKw.toFixed(1)} kW` :
+                      {(action.chargeKw ?? 0) > 0.01 ? `⚡ Charging at ${(action.chargeKw ?? 0).toFixed(1)} kW` :
+                        (action.dischargeKw ?? 0) > 0.01 ? `🔋 Discharging at ${(action.dischargeKw ?? 0).toFixed(1)} kW` :
                           '○ Standby'}
                     </span>
                     <span>Max (42.6 kWh)</span>
@@ -634,15 +645,15 @@ function App() {
                   </div>
                   <div style={{ padding: '0.6rem', background: 'rgba(59,130,246,0.08)', borderRadius: '8px', border: '1px solid rgba(59,130,246,0.15)' }}>
                     <ArrowRightLeft size={14} color="var(--accent-blue)" style={{ display: 'inline', marginRight: '4px' }} />
-                    Grid → Load: <strong style={{ color: 'var(--accent-blue)' }}>{action.importKw.toFixed(1)} kW</strong>
+                    Grid → Load: <strong style={{ color: 'var(--accent-blue)' }}>{(action.importKw ?? 0).toFixed(1)} kW</strong>
                   </div>
                   <div style={{ padding: '0.6rem', background: 'rgba(34,197,94,0.08)', borderRadius: '8px', border: '1px solid rgba(34,197,94,0.15)' }}>
                     <Zap size={14} color="var(--accent-green)" style={{ display: 'inline', marginRight: '4px' }} />
-                    PV → Grid: <strong style={{ color: 'var(--accent-green)' }}>{action.exportKw.toFixed(1)} kW</strong>
+                    PV → Grid: <strong style={{ color: 'var(--accent-green)' }}>{(action.exportKw ?? 0).toFixed(1)} kW</strong>
                   </div>
                   <div style={{ padding: '0.6rem', background: 'rgba(34,197,94,0.08)', borderRadius: '8px', border: '1px solid rgba(34,197,94,0.15)' }}>
                     <Leaf size={14} color="var(--accent-green)" style={{ display: 'inline', marginRight: '4px' }} />
-                    CO₂ Avoided: <strong style={{ color: 'var(--accent-green)' }}>{(parseFloat(nowPv) * liveData.carbonIntensity / 1000).toFixed(1)} kg</strong>
+                    CO₂ Avoided: <strong style={{ color: 'var(--accent-green)' }}>{(parseFloat(nowPv) * (parseFloat(liveData.carbonIntensity) || 0) / 1000).toFixed(1)} kg</strong>
                   </div>
                 </div>
 
@@ -674,22 +685,22 @@ function App() {
                         <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>☀️ PV Forecast</span>
                         <span style={{
                           fontSize: '0.7rem', padding: '2px 8px', borderRadius: '6px', fontWeight: 600,
-                          background: liveData.pvSource.includes('live') ? 'rgba(34,197,94,0.2)' : 'rgba(250,204,21,0.2)',
-                          color: liveData.pvSource.includes('live') ? 'var(--accent-green)' : '#facc15',
-                          border: `1px solid ${liveData.pvSource.includes('live') ? 'rgba(34,197,94,0.3)' : 'rgba(250,204,21,0.3)'}`
+                          background: (liveData.pvSource || '').includes('live') ? 'rgba(34,197,94,0.2)' : 'rgba(250,204,21,0.2)',
+                          color: (liveData.pvSource || '').includes('live') ? 'var(--accent-green)' : '#facc15',
+                          border: `1px solid ${(liveData.pvSource || '').includes('live') ? 'rgba(34,197,94,0.3)' : 'rgba(250,204,21,0.3)'}`
                         }}>
-                          {liveData.pvSource.includes('live') ? '🟢 Solcast Live' : liveData.pvSource === 'loading' ? '⏳ Loading...' : '🟡 Simulated'}
+                          {(liveData.pvSource || '').includes('live') ? '🟢 Solcast Live' : liveData.pvSource === 'loading' ? '⏳ Loading...' : '🟡 Simulated'}
                         </span>
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                         <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>🌍 Carbon Intensity</span>
                         <span style={{
                           fontSize: '0.7rem', padding: '2px 8px', borderRadius: '6px', fontWeight: 600,
-                          background: liveData.carbonSource.includes('live') ? 'rgba(34,197,94,0.2)' : 'rgba(250,204,21,0.2)',
-                          color: liveData.carbonSource.includes('live') ? 'var(--accent-green)' : '#facc15',
-                          border: `1px solid ${liveData.carbonSource.includes('live') ? 'rgba(34,197,94,0.3)' : 'rgba(250,204,21,0.3)'}`
+                          background: (liveData.carbonSource || '').includes('live') ? 'rgba(34,197,94,0.2)' : 'rgba(250,204,21,0.2)',
+                          color: (liveData.carbonSource || '').includes('live') ? 'var(--accent-green)' : '#facc15',
+                          border: `1px solid ${(liveData.carbonSource || '').includes('live') ? 'rgba(34,197,94,0.3)' : 'rgba(250,204,21,0.3)'}`
                         }}>
-                          {liveData.carbonSource.includes('live') ? '🟢 ElectricityMaps Live' : liveData.carbonSource === 'loading' ? '⏳ Loading...' : '🟡 Indian Grid Avg'}
+                          {(liveData.carbonSource || '').includes('live') ? '🟢 ElectricityMaps Live' : liveData.carbonSource === 'loading' ? '⏳ Loading...' : '🟡 Indian Grid Avg'}
                         </span>
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>

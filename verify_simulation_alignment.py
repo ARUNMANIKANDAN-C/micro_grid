@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 # Add current directory to path
 sys.path.append(os.getcwd())
 
-from decentralized_api import simulate_24h, get_city_pricing
+from decentralized_api import simulate_24h, city_pricing as get_city_pricing
 
 print("--- Verifying Simulation Alignment ---")
 

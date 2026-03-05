@@ -3,3 +3,7 @@ uvicorn[standard]
 numpy
 requests
 pydantic
+requests-cache
+retry-requests
+pandas
+openmeteo-requests

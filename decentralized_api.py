@@ -1,19 +1,37 @@
+"""
+Enhanced Decentralized 9-City Microgrid Optimization API
+Features:
+  1. Weather Module - historical + forecast, NumPy arrays
+  2. Multi-City Simulation - 9 cities, 3 clusters
+  3. Hierarchical MPC - Local / Regional / Global
+  4. Battery Degradation - SOH tracking + degradation cost
+  5. Optimization - NumPy vectorized IAROA
+  6. UI Features - formula explanation, parameter input
+  7. Performance Metrics - runtime + computational cost
+"""
+
 from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 import numpy as np
 import time as _time
 import math
 from datetime import datetime, timedelta
-from fastapi.middleware.cors import CORSMiddleware
-import openmeteo_requests
-import requests_cache
-from retry_requests import retry
-import pandas as pd
 
-# === API Setup ===
-app = FastAPI(title="Decentralized 5-City Microgrid Optimization API")
+# ── Optional weather SDK (graceful fallback) ───────────────────────────────
+try:
+    import openmeteo_requests
+    import requests_cache
+    from retry_requests import retry as retry_requests
+    _WEATHER_SDK = True
+    _cache_session = requests_cache.CachedSession("/tmp/.cache", expire_after=3600)
+    _retry_session = retry_requests(_cache_session, retries=3, backoff_factor=0.2)
+    _openmeteo = openmeteo_requests.Client(session=_retry_session)
+except Exception:
+    _WEATHER_SDK = False
 
+app = FastAPI(title="Enhanced 9-City Hierarchical Microgrid API v2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,1125 +40,921 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# FIX: Only import ems_router if ems_api module exists; skip gracefully otherwise
-try:
-    from ems_api import router as ems_router
-    app.include_router(ems_router)
-except ImportError:
-    pass
-
-# ============================
-# OPTIMIZATION SETTINGS
-# ============================
-OPTIMIZATION_SETTINGS: Dict[str, float] = {
+# ══════════════════════════════════════════════════════════════════════════════
+# GLOBAL OPTIMIZATION SETTINGS
+# ══════════════════════════════════════════════════════════════════════════════
+OPT_SETTINGS: Dict[str, float] = {
     "deg_cost_per_kwh": 0.50,
     "peak_demand_charge": 150.0,
-    "grid_emission_factor": 0.5,
+    "grid_emission_factor": 0.50,
     "carbon_tax": 2.0,
     "battery_eta_ch": 0.95,
     "battery_eta_dis": 0.95,
+    "soh_decay_per_cycle": 0.0001,   # SOH drops this fraction per full cycle
+    "p2p_price_inr_per_kwh": 5.0,
+    "demand_response_discount": 0.15,
 }
 
 class OptSettingsPayload(BaseModel):
     deg_cost_per_kwh: float = 0.50
     peak_demand_charge: float = 150.0
-    grid_emission_factor: float = 0.5
+    grid_emission_factor: float = 0.50
     carbon_tax: float = 2.0
     battery_eta_ch: float = 0.95
     battery_eta_dis: float = 0.95
+    soh_decay_per_cycle: float = 0.0001
+    p2p_price_inr_per_kwh: float = 5.0
+    demand_response_discount: float = 0.15
 
 @app.get("/optimization-settings")
 def get_opt_settings() -> Dict[str, float]:
-    """Get current global optimization parameters."""
-    return OPTIMIZATION_SETTINGS
+    return OPT_SETTINGS
 
 @app.post("/optimization-settings")
-def update_opt_settings(payload: OptSettingsPayload) -> Dict[str, Any]:
-    """Update global optimization parameters."""
-    OPTIMIZATION_SETTINGS.update(payload.dict())
-    return {"status": "ok", "settings": OPTIMIZATION_SETTINGS}
+def update_opt_settings(p: OptSettingsPayload) -> Dict[str, Any]:
+    OPT_SETTINGS.update(p.dict())
+    return {"status": "ok", "settings": OPT_SETTINGS}
+
+@app.get("/settings")
+def get_settings_legacy():
+    # Backwards compatibility for App.jsx
+    return {
+        "solcast_configured": False,
+        "carbon_configured": False,
+        "electricitymaps_zone": "IN-WE",
+        "pv_capacity_kw": 10.0,
+        "message": "Legacy settings endpoint"
+    }
+
+@app.post("/settings")
+def save_settings_legacy(data: Dict[str, Any]):
+    # Backwards compatibility for App.jsx
+    return {
+        "solcast_configured": True if data.get("solcast_api_key") else False,
+        "carbon_configured": True if data.get("electricitymaps_api_key") else False,
+        "electricitymaps_zone": data.get("electricitymaps_zone", "IN-WE"),
+        "pv_capacity_kw": data.get("pv_capacity_kw", 10.0),
+        "message": "Settings saved (legacy)"
+    }
 
 @app.get("/calculation-logic")
 def get_calculation_logic() -> Dict[str, Any]:
-    """Representation of how cost and carbon emissions are calculated."""
+    ef = OPT_SETTINGS["grid_emission_factor"]
+    ct = OPT_SETTINGS["carbon_tax"]
+    deg = OPT_SETTINGS["deg_cost_per_kwh"]
+    pdc = OPT_SETTINGS["peak_demand_charge"]
+    soh = OPT_SETTINGS["soh_decay_per_cycle"]
     return {
         "cost_calculation": {
-            "formula": "Total Cost = Energy Cost + Degradation Cost + Demand Charge + Carbon Cost",
-            "energy_cost": "(Grid Import * Import Price) - (Grid Export * Export Price)",
-            "degradation_cost": "Battery Discharge * Degradation Cost Per kWh",
-            "demand_charge": "Max Grid Import * Peak Demand Charge",
-            "carbon_cost": "Grid Import * Grid Emission Factor * Carbon Tax"
+            "formula": "Total Cost = Energy_Cost + Degradation_Cost + Demand_Charge + Carbon_Cost",
+            "energy_cost": "(P_imp × ImpPrice) − (P_exp × ExpPrice)",
+            "degradation_cost": f"P_dis × SOH_factor × ₹{deg}/kWh",
+            "demand_charge": f"max(P_imp) × ₹{pdc}/kW",
+            "carbon_cost": f"P_imp × {ef} kg_CO₂/kWh × ₹{ct}/kg",
         },
         "carbon_calculation": {
-            "formula": "Carbon Emissions = Grid Import * Grid Emission Factor",
-            "unit": "kg CO2"
+            "formula": "Carbon_kg = P_imp × Grid_Emission_Factor",
+            "emission_factor": f"{ef} kg CO₂/kWh",
+            "unit": "kg CO₂",
         },
-        "parameters": OPTIMIZATION_SETTINGS
+        "battery_degradation": {
+            "formula": "SOH(t+1) = SOH(t) − soh_decay_per_cycle × (|P_ch| + |P_dis|) / (2 × bat_cap)",
+            "soh_decay_per_cycle": soh,
+            "degradation_cost_formula": "deg_cost = P_dis × deg_cost_per_kwh × (2 − SOH)",
+        },
+        "hierarchical_mpc": {
+            "local_mpc": "Per-building: EV charging + HVAC + battery dispatch (single step)",
+            "regional_mpc": "Per-cluster: balance net load across 3 cities, enable P2P within cluster",
+            "global_mpc": "Across all 3 clusters: grid balancing, cross-cluster P2P arbitrage",
+        },
+        "demand_response": {
+            "formula": "Adj_Load = Base_Load × (1 − DR_Discount) during [18:00-22:00]",
+            "discount": f"{OPT_SETTINGS.get('demand_response_discount', 0.15)*100}%",
+        },
+        "parameters": OPT_SETTINGS,
     }
 
-# ============================
-# 5 CITY DEFINITIONS
-# ============================
+# ══════════════════════════════════════════════════════════════════════════════
+# 9-CITY DEFINITIONS (3 CLUSTERS)
+# ══════════════════════════════════════════════════════════════════════════════
 CITIES: Dict[str, Any] = {
-    "delhi": {
-        "name": "Delhi",
-        "lat": 28.6139, "lon": 77.2090,
-        "pv_capacity_kw": 150.0,
-        "wind_capacity_kw": 80.0,
-        "thermal_capacity_kw": 100.0,
-        "houses_count": 120,
-        "buildings_count": 8,
-        "bat_cap_kwh": 500.0,
-        "initial_soc_pct": 0.55,
-        "peak_load_kw": 25.0,
-        "grid_zone": "IN-NO",
-        "climate": "hot_arid",
-        "base_import_price": [4,4,4,4,5,5,7,8,9,10,11,11,10,9,8,7,9,11,13,11,8,6,5,4],
-        "load_profile": [3,2,2,3,5,7,10,15,18,21,23,25,24,22,19,16,12,10,8,6,5,4,3,3],
-    },
-    "mumbai": {
-        "name": "Mumbai",
-        "lat": 19.0760, "lon": 72.8777,
-        "pv_capacity_kw": 120.0,
-        "wind_capacity_kw": 150.0,
-        "thermal_capacity_kw": 80.0,
-        "houses_count": 150,
-        "buildings_count": 12,
-        "bat_cap_kwh": 450.0,
-        "initial_soc_pct": 0.50,
-        "peak_load_kw": 22.0,
-        "grid_zone": "IN-WE",
-        "climate": "tropical",
-        "base_import_price": [5,5,4,4,5,6,7,8,9,10,10,10,9,8,7,6,8,10,12,10,7,6,5,5],
-        "load_profile": [4,3,3,3,5,7,9,13,16,19,21,22,21,19,17,15,11,9,7,6,5,4,4,4],
-    },
-    "chennai": {
-        "name": "Chennai",
-        "lat": 13.0827, "lon": 80.2707,
-        "pv_capacity_kw": 180.0,
-        "wind_capacity_kw": 120.0,
-        "thermal_capacity_kw": 60.0,
-        "houses_count": 130,
-        "buildings_count": 10,
-        "bat_cap_kwh": 550.0,
-        "initial_soc_pct": 0.60,
-        "peak_load_kw": 20.0,
-        "grid_zone": "IN-SO",
-        "climate": "tropical_coastal",
-        "base_import_price": [4,4,3,3,4,5,6,7,8,9,10,10,9,8,7,6,7,9,11,9,7,5,4,4],
-        "load_profile": [3,3,2,3,4,6,8,12,15,18,20,20,19,18,16,14,10,8,7,5,4,3,3,3],
-    },
-    "kolkata": {
-        "name": "Kolkata",
-        "lat": 22.5726, "lon": 88.3639,
-        "pv_capacity_kw": 110.0,
-        "wind_capacity_kw": 100.0,
-        "thermal_capacity_kw": 80.0,
-        "houses_count": 110,
-        "buildings_count": 7,
-        "bat_cap_kwh": 400.0,
-        "initial_soc_pct": 0.45,
-        "peak_load_kw": 18.0,
-        "grid_zone": "IN-EA",
-        "climate": "humid_subtropical",
-        "base_import_price": [4,3,3,3,4,5,6,7,8,9,10,10,9,8,7,6,7,9,11,9,7,5,4,4],
-        "load_profile": [2,2,2,2,4,5,7,10,13,16,18,18,17,16,14,12,9,7,6,5,4,3,2,2],
-    },
-    "jaipur": {
-        "name": "Jaipur",
-        "lat": 26.9124, "lon": 75.7873,
-        "pv_capacity_kw": 200.0,
-        "wind_capacity_kw": 50.0,
-        "thermal_capacity_kw": 40.0,
-        "houses_count": 90,
-        "buildings_count": 4,
-        "bat_cap_kwh": 480.0,
-        "initial_soc_pct": 0.52,
-        "peak_load_kw": 20.0,
-        "grid_zone": "IN-NO",
-        "climate": "hot_desert",
-        "base_import_price": [4,4,4,4,5,5,6,7,8,9,10,10,9,8,7,6,8,10,12,10,7,6,5,4],
-        "load_profile": [2,2,2,3,4,6,8,11,14,17,19,20,19,17,15,13,10,8,6,5,4,3,2,2],
-    },
+    # ── Cluster NORTH ─────────────────────────────────────────────
+    "delhi":    {"name":"Delhi",    "cluster":"north","lat":28.61,"lon":77.21,
+                 "pv_cap":150,"wind_cap":80,"thermal_cap":100,"bat_cap":500,
+                 "houses":120,"buildings":8,"init_soc":0.55,"peak_load":25,
+                 "climate":"hot_arid","grid_zone":"IN-NO",
+                 "import_price":[4,4,4,4,5,5,7,8,9,10,11,11,10,9,8,7,9,11,13,11,8,6,5,4],
+                 "load_profile":[3,2,2,3,5,7,10,15,18,21,23,25,24,22,19,16,12,10,8,6,5,4,3,3]},
+    "jaipur":   {"name":"Jaipur",   "cluster":"north","lat":26.91,"lon":75.79,
+                 "pv_cap":200,"wind_cap":50,"thermal_cap":40,"bat_cap":480,
+                 "houses":90,"buildings":4,"init_soc":0.52,"peak_load":20,
+                 "climate":"hot_desert","grid_zone":"IN-NO",
+                 "import_price":[4,4,4,4,5,5,6,7,8,9,10,10,9,8,7,6,8,10,12,10,7,6,5,4],
+                 "load_profile":[2,2,2,3,4,6,8,11,14,17,19,20,19,17,15,13,10,8,6,5,4,3,2,2]},
+    "lucknow":  {"name":"Lucknow",  "cluster":"north","lat":26.85,"lon":80.95,
+                 "pv_cap":120,"wind_cap":60,"thermal_cap":80,"bat_cap":420,
+                 "houses":100,"buildings":6,"init_soc":0.50,"peak_load":22,
+                 "climate":"humid_subtropical","grid_zone":"IN-NO",
+                 "import_price":[4,3,3,3,4,5,6,7,8,9,10,10,9,8,7,6,8,10,12,10,7,5,4,4],
+                 "load_profile":[2,2,2,2,4,5,8,12,15,17,19,20,19,17,14,12,9,7,6,5,4,3,2,2]},
+    # ── Cluster WEST ──────────────────────────────────────────────
+    "mumbai":   {"name":"Mumbai",   "cluster":"west","lat":19.08,"lon":72.88,
+                 "pv_cap":120,"wind_cap":150,"thermal_cap":80,"bat_cap":450,
+                 "houses":150,"buildings":12,"init_soc":0.50,"peak_load":22,
+                 "climate":"tropical","grid_zone":"IN-WE",
+                 "import_price":[5,5,4,4,5,6,7,8,9,10,10,10,9,8,7,6,8,10,12,10,7,6,5,5],
+                 "load_profile":[4,3,3,3,5,7,9,13,16,19,21,22,21,19,17,15,11,9,7,6,5,4,4,4]},
+    "pune":     {"name":"Pune",     "cluster":"west","lat":18.52,"lon":73.86,
+                 "pv_cap":140,"wind_cap":80,"thermal_cap":60,"bat_cap":400,
+                 "houses":110,"buildings":8,"init_soc":0.48,"peak_load":18,
+                 "climate":"tropical","grid_zone":"IN-WE",
+                 "import_price":[4,4,4,4,5,5,6,7,8,9,10,10,9,8,7,6,7,9,11,9,7,5,4,4],
+                 "load_profile":[2,2,2,3,4,6,8,11,14,17,18,19,18,17,15,13,10,8,6,5,4,3,2,2]},
+    "ahmedabad":{"name":"Ahmedabad","cluster":"west","lat":23.02,"lon":72.57,
+                 "pv_cap":180,"wind_cap":70,"thermal_cap":50,"bat_cap":460,
+                 "houses":95,"buildings":5,"init_soc":0.53,"peak_load":19,
+                 "climate":"hot_arid","grid_zone":"IN-WE",
+                 "import_price":[4,4,3,3,4,5,6,7,8,9,10,10,9,8,7,6,7,9,11,9,7,5,4,4],
+                 "load_profile":[2,2,2,2,4,5,7,10,13,16,18,19,18,16,14,12,9,7,6,5,4,3,2,2]},
+    # ── Cluster SOUTH ─────────────────────────────────────────────
+    "chennai":  {"name":"Chennai",  "cluster":"south","lat":13.08,"lon":80.27,
+                 "pv_cap":180,"wind_cap":120,"thermal_cap":60,"bat_cap":550,
+                 "houses":130,"buildings":10,"init_soc":0.60,"peak_load":20,
+                 "climate":"tropical_coastal","grid_zone":"IN-SO",
+                 "import_price":[4,4,3,3,4,5,6,7,8,9,10,10,9,8,7,6,7,9,11,9,7,5,4,4],
+                 "load_profile":[3,3,2,3,4,6,8,12,15,18,20,20,19,18,16,14,10,8,7,5,4,3,3,3]},
+    "kolkata":  {"name":"Kolkata",  "cluster":"south","lat":22.57,"lon":88.36,
+                 "pv_cap":110,"wind_cap":100,"thermal_cap":80,"bat_cap":400,
+                 "houses":110,"buildings":7,"init_soc":0.45,"peak_load":18,
+                 "climate":"humid_subtropical","grid_zone":"IN-EA",
+                 "import_price":[4,3,3,3,4,5,6,7,8,9,10,10,9,8,7,6,7,9,11,9,7,5,4,4],
+                 "load_profile":[2,2,2,2,4,5,7,10,13,16,18,18,17,16,14,12,9,7,6,5,4,3,2,2]},
+    "bangalore":{"name":"Bangalore","cluster":"south","lat":12.97,"lon":77.59,
+                 "pv_cap":160,"wind_cap":90,"thermal_cap":50,"bat_cap":480,
+                 "houses":140,"buildings":11,"init_soc":0.58,"peak_load":21,
+                 "climate":"tropical_highland","grid_zone":"IN-SO",
+                 "import_price":[4,4,3,3,4,5,6,7,8,9,10,10,9,8,7,6,7,9,11,9,7,5,4,4],
+                 "load_profile":[3,2,2,3,4,6,8,12,15,18,20,21,20,18,16,14,10,8,7,5,4,3,3,3]},
 }
 
-# ============================
-# CITY STATE TRACKER
-# ============================
-# FIX: Use explicit Dict[str, Dict[str, float]] type
+CLUSTERS: Dict[str, List[str]] = {
+    "north": ["delhi", "jaipur", "lucknow"],
+    "west":  ["mumbai", "pune", "ahmedabad"],
+    "south": ["chennai", "kolkata", "bangalore"],
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CITY STATE (SOC + SOH)
+# ══════════════════════════════════════════════════════════════════════════════
 city_states: Dict[str, Dict[str, float]] = {}
 
-def _init_city_states() -> None:
+def _init_states() -> None:
     global city_states
     city_states = {}
     for cid, cfg in CITIES.items():
-        soc = float(cfg["initial_soc_pct"]) * float(cfg["bat_cap_kwh"])
+        soc = cfg["init_soc"] * cfg["bat_cap"]
         city_states[cid] = {
-            "soc_kwh": soc,
-            "last_pv_kw": 0.0,
-            "last_wind_kw": 0.0,
-            "last_thermal_kw": 0.0,
-            "last_load_kw": 0.0,
-            "last_import_kw": 0.0,
-            "last_export_kw": 0.0,
-            "last_charge_kw": 0.0,
-            "last_discharge_kw": 0.0,
-            "surplus_kw": 0.0,
-            "deficit_kw": 0.0,
+            "soc_kwh": float(soc),
+            "soh": 1.0,          # State of Health 0→1
+            "cycles": 0.0,
+            "last_pv": 0.0, "last_wind": 0.0, "last_thermal": 0.0,
+            "last_load": 0.0, "last_import": 0.0, "last_export": 0.0,
+            "last_charge": 0.0, "last_discharge": 0.0,
+            "cumulative_cost": 0.0, "cumulative_carbon": 0.0,
         }
 
-_init_city_states()
+_init_states()
 
-
-# ============================
-# WEATHER DATA (Open-Meteo SDK)
-# ============================
+# ══════════════════════════════════════════════════════════════════════════════
+# WEATHER MODULE  (historical + forecast, NumPy output)
+# ══════════════════════════════════════════════════════════════════════════════
 WEATHER_CACHE: Dict[str, Any] = {}
 
-# Setup Open-Meteo client with cache and retry
-cache_session = requests_cache.CachedSession('.cache', expire_after=3600)
-retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
-openmeteo = openmeteo_requests.Client(session=retry_session)
+def _simulated_weather(lat: float, n_hours: int, base_date: str) -> Dict[str, np.ndarray]:
+    """Deterministic simulated weather using lat for climate bias."""
+    rng = np.random.default_rng(seed=abs(int(lat * 100)))
+    t_base = 22 + (lat - 13) * 0.3
+    h = np.arange(n_hours)
+    temps = t_base + 6 * np.sin((h - 6) * np.pi / 12) + rng.normal(0, 0.5, n_hours)
+    winds = np.abs(12 * np.sin(h * np.pi / 12) + 4) + rng.normal(0, 1, n_hours)
+    solar_raw = np.maximum(0, np.sin((h % 24 - 6) * np.pi / 12))
+    solar = 900 * solar_raw + rng.normal(0, 20, n_hours)
+    solar = np.maximum(0, solar)
+    humidity = 55 + 15 * np.cos(h * np.pi / 18) + rng.normal(0, 2, n_hours)
+    cloud_cover = 20 + 10 * np.sin(h * np.pi / 24) + rng.uniform(0, 15, n_hours)
+    precipitation = np.maximum(0, rng.normal(0.1, 0.3, n_hours))
+    return {
+        "temperature_2m": temps.astype(np.float32),
+        "wind_speed_10m": np.clip(winds, 0, 30).astype(np.float32),
+        "shortwave_radiation": solar.astype(np.float32),
+        "relative_humidity_2m": np.clip(humidity, 20, 95).astype(np.float32),
+        "cloud_cover": np.clip(cloud_cover, 0, 100).astype(np.float32),
+        "precipitation": precipitation.astype(np.float32),
+    }
 
-def get_weather_data(
-    city_id: str,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None
-) -> Dict[str, Any]:
-    """Fetches historical weather data from Open-Meteo archive API."""
-    if start_date is None:
-        today = datetime.now()
-        start_dt = today - timedelta(days=2)
-        start_date = start_dt.strftime("%Y-%m-%d")
-        end_date = (start_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-    elif end_date is None:
-        end_date = start_date
+def _fetch_openmeteo(lat: float, lon: float, start_date: str, end_date: str,
+                     mode: str = "archive") -> Optional[Dict[str, np.ndarray]]:
+    if not _WEATHER_SDK:
+        return None
+    try:
+        url = ("https://archive-api.open-meteo.com/v1/archive"
+               if mode == "archive"
+               else "https://api.open-meteo.com/v1/forecast")
+        hvars = ["temperature_2m","relative_humidity_2m","wind_speed_10m",
+                 "shortwave_radiation","cloud_cover","precipitation"]
+        params: Dict[str, Any] = {
+            "latitude": lat, "longitude": lon,
+            "hourly": hvars,
+        }
+        if mode == "archive":
+            params["start_date"] = start_date
+            params["end_date"] = end_date
+        responses = _openmeteo.weather_api(url, params=params)
+        hourly = responses[0].Hourly()
+        result: Dict[str, np.ndarray] = {}
+        for i, v in enumerate(hvars):
+            result[v] = hourly.Variables(i).ValuesAsNumpy().astype(np.float32)
+        return result
+    except Exception as e:
+        print(f"[Weather API] {e}")
+        return None
 
+def get_weather(city_id: str, start_date: str, end_date: str) -> Dict[str, Any]:
+    """Returns both historical (archive) and forecast arrays as NumPy."""
     cache_key = f"{city_id}_{start_date}_{end_date}"
-    now = _time.time()
-    if cache_key in WEATHER_CACHE and now - WEATHER_CACHE[cache_key]["timestamp"] < 3600:
-        return WEATHER_CACHE[cache_key]["data"]  # type: ignore[return-value]
+    now_ts = _time.time()
+    if cache_key in WEATHER_CACHE and now_ts - WEATHER_CACHE[cache_key]["ts"] < 3600:
+        return WEATHER_CACHE[cache_key]["data"]
 
     cfg = CITIES[city_id]
-    try:
-        url = "https://archive-api.open-meteo.com/v1/archive"
-        hourly_vars = [
-            "temperature_2m", "relative_humidity_2m", "apparent_temperature",
-            "wind_direction_10m", "wind_direction_100m", "wind_speed_100m",
-            "wind_speed_10m", "cloud_cover_low", "cloud_cover_mid",
-            "cloud_cover_high", "cloud_cover", "dew_point_2m",
-            "precipitation", "snowfall", "rain", "shortwave_radiation"
-        ]
-        params = {
-            "latitude": cfg["lat"],
-            "longitude": cfg["lon"],
-            "start_date": start_date,
-            "end_date": end_date,
-            "hourly": hourly_vars
-        }
-        responses = openmeteo.weather_api(url, params=params)
-        response = responses[0]
-        hourly = response.Hourly()
+    lat, lon = cfg["lat"], cfg["lon"]
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    n_hours = int((end_dt - start_dt).total_seconds() / 3600) + 24
 
-        weather_dict: Dict[str, List[float]] = {}
-        for i, var_name in enumerate(hourly_vars):
-            weather_dict[var_name] = hourly.Variables(i).ValuesAsNumpy().tolist()
+    # Historical
+    hist = _fetch_openmeteo(lat, lon, start_date, end_date, mode="archive")
+    if hist is None:
+        hist = _simulated_weather(lat, n_hours, start_date)
+    # Trim / pad to n_hours
+    for k in hist:
+        arr = hist[k]
+        if len(arr) < n_hours:
+            pad = np.full(n_hours - len(arr), arr[-1] if len(arr) > 0 else 0, dtype=np.float32)
+            hist[k] = np.concatenate([arr, pad])
+        else:
+            hist[k] = arr[:n_hours]
 
-        # FIX: Compute expected hours correctly
-        start_dt_obj = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt_obj = datetime.strptime(end_date, "%Y-%m-%d")
-        expected_hours = int((end_dt_obj - start_dt_obj).total_seconds() / 3600) + 24
+    # Forecast (next 24h)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    tomorrow_str = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    fcast = _fetch_openmeteo(lat, lon, today_str, tomorrow_str, mode="forecast")
+    if fcast is None:
+        fcast = _simulated_weather(lat, 48, today_str)
+    for k in fcast:
+        arr = fcast[k]
+        if len(arr) < 48:
+            pad = np.full(48 - len(arr), arr[-1] if len(arr) > 0 else 0, dtype=np.float32)
+            fcast[k] = np.concatenate([arr, pad])
+        else:
+            fcast[k] = arr[:48]
 
-        for var_name in hourly_vars:
-            arr = list(weather_dict[var_name])
-            while len(arr) < expected_hours:
-                arr.append(arr[-1] if arr else 0.0)
-            weather_dict[var_name] = arr[:expected_hours]
-
-        result: Dict[str, Any] = {
-            "weather": weather_dict,
-            "temps": weather_dict["temperature_2m"],
-            "winds": weather_dict["wind_speed_10m"],
-            "solar": weather_dict["shortwave_radiation"],
-            "humidity": weather_dict["relative_humidity_2m"],
-            "cloud_cover": weather_dict["cloud_cover"],
-            "precipitation": weather_dict["precipitation"],
-            "start_date": start_date,
-            "end_date": end_date,
-        }
-        WEATHER_CACHE[cache_key] = {"timestamp": now, "data": result}
-
-        print(f"\n[Weather] Fetched {city_id} for {start_date}")
-        print(f"{'Hour':<6} | {'Temp':<6} | {'Wind':<6} | {'Solar':<6}")
-        print("-" * 35)
-        for h in range(24):
-            temps_list: List[float] = result["temps"]
-            winds_list: List[float] = result["winds"]
-            solar_list: List[float] = result["solar"]
-            if h < len(temps_list):
-                print(f"{h:02d}:00  | {temps_list[h]:<6.1f} | {winds_list[h]:<6.1f} | {solar_list[h]:<6.1f}")
-
-        return result
-
-    except Exception as e:
-        print(f"Weather API error for {city_id}: {e}")
-
-    # Fallback: simulated weather
-    start_dt_fb = datetime.strptime(start_date, "%Y-%m-%d")
-    end_dt_fb = datetime.strptime(end_date, "%Y-%m-%d")
-    expected_hours = int((end_dt_fb - start_dt_fb).total_seconds() / 3600) + 24
-
-    base_tmp = 25.0
-    temps = [float(base_tmp + 5 * math.sin((h - 6) * math.pi / 12)) for h in range(expected_hours)]
-    winds = [float(abs(15 * math.sin(h * math.pi / 12) + 5 * float(np.random.randn()))) for h in range(expected_hours)]
-    solar = [float(800 * max(0.0, math.sin((h - 6) * math.pi / 12))) for h in range(expected_hours)]
-
-    fallback: Dict[str, Any] = {
-        "temps": temps, "winds": winds, "solar": solar,
-        "humidity": [50.0] * expected_hours,
-        "cloud_cover": [30.0] * expected_hours,
-        "precipitation": [0.0] * expected_hours,
-        "weather": {
-            "temperature_2m": temps,
-            "wind_speed_10m": winds,
-            "shortwave_radiation": solar,
-            "relative_humidity_2m": [50.0] * expected_hours,
-            "cloud_cover": [30.0] * expected_hours,
-            "precipitation": [0.0] * expected_hours
-        },
+    result: Dict[str, Any] = {
+        "historical": hist,
+        "forecast": fcast,
+        "n_hours": n_hours,
         "start_date": start_date,
         "end_date": end_date,
+        # convenience shortcuts
+        "temps": hist["temperature_2m"],
+        "winds": hist["wind_speed_10m"],
+        "solar": hist["shortwave_radiation"],
+        "humidity": hist["relative_humidity_2m"],
+        "cloud_cover": hist["cloud_cover"],
+        "precipitation": hist["precipitation"],
+        # forecast shortcuts
+        "fcast_temps": fcast["temperature_2m"],
+        "fcast_winds": fcast["wind_speed_10m"],
+        "fcast_solar": fcast["shortwave_radiation"],
     }
-    return fallback
+    WEATHER_CACHE[cache_key] = {"ts": now_ts, "data": result}
+    return result
 
-
-def generate_generation_forecasts(
-    city_id: str,
-    hours: int = 24,
-    start_hour: Optional[int] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None
-) -> tuple:
-    # FIX: Default start_hour to 0 for historical simulation; use current hour for live
-    if start_hour is None:
-        start_hour = datetime.now().hour
-
+# ══════════════════════════════════════════════════════════════════════════════
+# GENERATION + LOAD FORECASTS (fully vectorised NumPy)
+# ══════════════════════════════════════════════════════════════════════════════
+def gen_forecasts(city_id: str, start_hour: int, hours: int,
+                  wx: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     cfg = CITIES[city_id]
-    weather_res = get_weather_data(city_id, start_date, end_date)
+    idx = (np.arange(hours) + start_hour) % wx["n_hours"]
+    solar = wx["solar"][idx]
+    wind_spd = wx["winds"][idx]
 
-    solar_data: List[float] = weather_res["weather"].get("shortwave_radiation", [])
-    wind_data: List[float] = weather_res["weather"].get("wind_speed_10m", [])
-
-    pv_cap = float(cfg["pv_capacity_kw"])
-    wind_cap = float(cfg["wind_capacity_kw"])
-    therm_cap = float(cfg["thermal_capacity_kw"])
-
-    pv: List[float] = []
-    wind: List[float] = []
-    thermal: List[float] = []
-
-    n_solar = len(solar_data)
-    n_wind = len(wind_data)
-
-    for h in range(hours):
-        idx = start_hour + h
-
-        # FIX: Safe modulo with length check
-        s_val = float(solar_data[idx % n_solar]) if n_solar > 0 else 0.0
-        pv_val = max(0.0, s_val / 1000.0 * pv_cap)
-        pv.append(round(pv_val, 2))
-
-        w_val = float(wind_data[idx % n_wind]) if n_wind > 0 else 0.0
-        w_factor = (w_val / 15.0) ** 3
-        wind.append(round(min(wind_cap, wind_cap * w_factor), 2))
-
-        # FIX: Use deterministic thermal (no random) for reproducible simulation
-        thermal.append(round(therm_cap * 0.85, 2))
-
+    pv = np.clip(solar / 1000.0 * cfg["pv_cap"], 0, cfg["pv_cap"]).astype(np.float32)
+    w_factor = np.clip((wind_spd / 15.0) ** 3, 0, 1)
+    wind = (w_factor * cfg["wind_cap"]).astype(np.float32)
+    thermal = np.full(hours, cfg["thermal_cap"] * 0.85, dtype=np.float32)
     return pv, wind, thermal
 
-
-def generate_dynamic_load_forecast(
-    city_id: str,
-    hours: int = 24,
-    start_hour: Optional[int] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None
-) -> List[float]:
-    if start_hour is None:
-        start_hour = datetime.now().hour
-
+def load_forecast(city_id: str, start_hour: int, hours: int,
+                  wx: Dict[str, Any]) -> np.ndarray:
     cfg = CITIES[city_id]
-    weather_res = get_weather_data(city_id, start_date, end_date)
+    idx = (np.arange(hours) + start_hour) % wx["n_hours"]
+    temps = wx["temps"][idx]
+    profile = np.array(cfg["load_profile"], dtype=np.float32)
 
-    temp_data: List[float] = weather_res.get("temps", [25.0] * 48)
+    hvac = np.ones(hours, dtype=np.float32)
+    hvac += np.where(temps > 30, (temps - 30) * 0.05, 0)
+    hvac += np.where(temps < 15, (15 - temps) * 0.04, 0)
+    clock_h = (np.arange(hours) + start_hour) % 24
+    daily_mod = profile[clock_h] / 10.0
+    load = (cfg["houses"] * 0.5 + cfg["buildings"] * 10.0) * hvac * daily_mod
+    
+    # Apply Demand Response discount during peak hours (18:00 - 22:00)
+    dr_discount = float(OPT_SETTINGS.get("demand_response_discount", 0.15))
+    peak_mask = (clock_h >= 18) & (clock_h <= 22)
+    load[peak_mask] *= (1.0 - dr_discount)
+    
+    return load.astype(np.float32)
 
-    h_count = int(cfg["houses_count"])
-    b_count = int(cfg["buildings_count"])
-    avg_house_base = 0.5
-    avg_building_base = 10.0
-    load_profile: List[int] = cfg.get("load_profile", [10] * 24)
-
-    loads: List[float] = []
-    n_temp = len(temp_data)
-
-    for h in range(hours):
-        idx = start_hour + h
-        tmp = float(temp_data[idx % n_temp]) if n_temp > 0 else 25.0
-
-        hvac_factor = 1.0
-        if tmp > 30.0:
-            hvac_factor += (tmp - 30.0) * 0.05
-        elif tmp < 15.0:
-            hvac_factor += (15.0 - tmp) * 0.04
-
-        # FIX: Always index into load_profile by actual clock hour (0-23)
-        clock_hour = idx % 24
-        daily_mod = float(load_profile[clock_hour]) / 10.0
-
-        load_val = (h_count * avg_house_base + b_count * avg_building_base) * hvac_factor * daily_mod
-        loads.append(round(float(load_val), 2))
-
-    return loads
-
-
-def get_city_pricing(city_id: str, hours: int = 24, start_hour: int = 0) -> tuple:
-    """Returns import/export prices aligned with the starting hour."""
-    cfg = CITIES[city_id]
-    imp = np.array(cfg["base_import_price"], dtype=float)
-
-    # FIX: Ensure roll is within bounds
-    roll_by = int(start_hour) % 24
-    imp = np.roll(imp, -roll_by)
-
+def city_pricing(city_id: str, start_hour: int, hours: int) -> Tuple[np.ndarray, np.ndarray]:
+    base = np.array(CITIES[city_id]["import_price"], dtype=np.float32)
     if hours != 24:
-        imp = np.interp(np.linspace(0, 24, hours), np.arange(24), imp)
+        base = np.interp(np.linspace(0, 24, hours), np.arange(24), base).astype(np.float32)
+    roll = int(start_hour) % 24
+    imp = np.roll(base, -roll)
+    return imp, (imp * 0.5).astype(np.float32)
 
-    exp = imp * 0.5
-    return [round(float(x), 2) for x in imp], [round(float(x), 2) for x in exp]
+# ══════════════════════════════════════════════════════════════════════════════
+# BATTERY DEGRADATION MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+def update_soh(soh: float, p_ch: float, p_dis: float, bat_cap: float) -> Tuple[float, float]:
+    """Returns (new_soh, throughput_fraction)."""
+    decay = float(OPT_SETTINGS["soh_decay_per_cycle"])
+    throughput = (abs(p_ch) + abs(p_dis)) / (2.0 * max(bat_cap, 1))
+    new_soh = max(0.5, soh - decay * throughput)
+    return new_soh, throughput
 
+def degradation_cost(p_dis: float, soh: float) -> float:
+    deg_rate = float(OPT_SETTINGS["deg_cost_per_kwh"])
+    # Higher cost when SOH is low (battery near end of life)
+    return float(p_dis * deg_rate * (2.0 - soh))
 
-# ============================
-# IAROA OPTIMIZER
-# ============================
+# ══════════════════════════════════════════════════════════════════════════════
+# IAROA OPTIMIZER (vectorised batch evaluation)
+# ══════════════════════════════════════════════════════════════════════════════
 class MicrogridEMS:
-    def __init__(
-        self,
-        pv_forecast: List[float],
-        load_forecast: List[float],
-        import_price: List[float],
-        export_price: List[float],
-        soc: float,
-        bat_cap: float,
-        pv_cap: float
-    ) -> None:
-        self.pv_gen = np.array(pv_forecast, dtype=float)
-        self.load = np.array(load_forecast, dtype=float)
-        self.import_price = np.array(import_price, dtype=float)
-        self.export_price = np.array(export_price, dtype=float)
-        self.horizon = len(pv_forecast)
-        self.dim = self.horizon * 3
-        self.pv_capacity = float(pv_cap)
+    def __init__(self, pv_fc: np.ndarray, load_fc: np.ndarray,
+                 imp_p: np.ndarray, exp_p: np.ndarray,
+                 soc: float, bat_cap: float, pv_cap: float,
+                 soh: float = 1.0) -> None:
+        self.pv = pv_fc; self.load = load_fc
+        self.imp_p = imp_p; self.exp_p = exp_p
+        self.H = len(pv_fc)
         self.bat_cap = float(bat_cap)
-        self.soc_min = 0.2 * self.bat_cap
-        self.soc_max = 0.9 * self.bat_cap
+        self.soc_min = 0.2 * bat_cap; self.soc_max = 0.9 * bat_cap
+        self.p_bat_max = bat_cap * 0.25
+        self.pv_cap = float(pv_cap)
         self.initial_soc = float(soc)
-        self.p_bat_max = self.bat_cap * 0.25
-        self.eta_ch = float(OPTIMIZATION_SETTINGS["battery_eta_ch"])
-        self.eta_dis = float(OPTIMIZATION_SETTINGS["battery_eta_dis"])
-        self.dt = 1.0
-        self.deg_cost_per_kwh = float(OPTIMIZATION_SETTINGS["deg_cost_per_kwh"])
-        self.peak_demand_charge = float(OPTIMIZATION_SETTINGS["peak_demand_charge"])
-        self.grid_emission_factor = float(OPTIMIZATION_SETTINGS["grid_emission_factor"])
-        self.carbon_tax = float(OPTIMIZATION_SETTINGS["carbon_tax"])
-        self._last_P_imp = np.zeros(self.horizon)
-        self._last_P_exp = np.zeros(self.horizon)
+        self.soh = float(soh)
+        self.eta_ch = OPT_SETTINGS["battery_eta_ch"]
+        self.eta_dis = OPT_SETTINGS["battery_eta_dis"]
+        self.deg_base = OPT_SETTINGS["deg_cost_per_kwh"]
+        self.pdc = OPT_SETTINGS["peak_demand_charge"]
+        self.emi = OPT_SETTINGS["grid_emission_factor"]
+        self.ctx = OPT_SETTINGS["carbon_tax"]
+        self.dim = self.H * 3
 
-    def get_bounds(self) -> tuple:
+    def bounds(self) -> Tuple[np.ndarray, np.ndarray]:
         lb = np.zeros(self.dim)
-        ub = np.concatenate([
-            np.ones(self.horizon) * self.p_bat_max,
-            np.ones(self.horizon) * self.p_bat_max,
-            np.ones(self.horizon) * self.pv_capacity
-        ])
+        ub = np.concatenate([np.ones(self.H) * self.p_bat_max,
+                              np.ones(self.H) * self.p_bat_max,
+                              np.ones(self.H) * self.pv_cap])
         return lb, ub
 
-    def fitness_function(self, x: np.ndarray) -> Any:
-        is_1d = x.ndim == 1
-        x_batched = x.reshape(1, -1) if is_1d else x
-
-        H = self.horizon
-        PF = 1e6
-        Pch = x_batched[:, 0:H]
-        Pdis = x_batched[:, H:2*H]
-        Curt = x_batched[:, 2*H:3*H]
-
-        load = self.load.reshape(1, H)
-        pv_gen = self.pv_gen.reshape(1, H)
-
-        net = load + Pch + Curt - pv_gen - Pdis
-        P_imp = np.maximum(0.0, net)
-        P_exp = np.maximum(0.0, -net)
-
-        soc_changes = (self.eta_ch * Pch - Pdis / self.eta_dis) * self.dt
-        soc_traj = self.initial_soc + np.cumsum(soc_changes, axis=1)
-
-        penalty = np.zeros(x_batched.shape[0])
-        penalty += np.sum(np.maximum(0.0, self.soc_min - soc_traj) * PF, axis=1)
-        penalty += np.sum(np.maximum(0.0, soc_traj - self.soc_max) * PF, axis=1)
-        penalty += np.sum(1e4 * Pch * Pdis, axis=1)
-        penalty += np.sum(np.maximum(0.0, P_imp - 50.0) * PF, axis=1)
-        penalty += np.sum(np.maximum(0.0, P_exp - 50.0) * PF, axis=1)
-
-        imp_p = self.import_price.reshape(1, H)
-        exp_p = self.export_price.reshape(1, H)
-
-        t_eng = np.sum(imp_p * P_imp - exp_p * P_exp, axis=1)
-        t_deg = np.sum(self.deg_cost_per_kwh * Pdis, axis=1)
-        t_emi = np.sum(self.grid_emission_factor * P_imp * self.carbon_tax, axis=1)
-        dem_cost = np.max(P_imp, axis=1) * self.peak_demand_charge
-
-        if is_1d:
-            self._last_P_imp = P_imp[0]
-            self._last_P_exp = P_exp[0]
-
-        fitness = t_eng + t_deg + dem_cost + t_emi + penalty
-        return float(fitness[0]) if is_1d else fitness
-
+    def fitness(self, x: np.ndarray) -> Any:
+        is1d = x.ndim == 1
+        xb = x.reshape(1, -1) if is1d else x
+        H = self.H; PF = 1e6
+        Pch  = xb[:, :H];       Pdis = xb[:, H:2*H];   Curt = xb[:, 2*H:]
+        load = self.load.reshape(1, H); pv = self.pv.reshape(1, H)
+        net  = load + Pch + Curt - pv - Pdis
+        Pimp = np.maximum(0, net);  Pexp = np.maximum(0, -net)
+        soc_chg = (self.eta_ch * Pch - Pdis / self.eta_dis)
+        soc_t   = self.initial_soc + np.cumsum(soc_chg, axis=1)
+        pen = (np.sum(np.maximum(0, self.soc_min - soc_t) * PF, axis=1) +
+               np.sum(np.maximum(0, soc_t - self.soc_max) * PF, axis=1) +
+               np.sum(1e4 * Pch * Pdis, axis=1) +
+               np.sum(np.maximum(0, Pimp - 60) * PF, axis=1))
+        imp_p = self.imp_p.reshape(1, H); exp_p = self.exp_p.reshape(1, H)
+        deg_factor = 2.0 - self.soh
+        t_eng  = np.sum(imp_p * Pimp - exp_p * Pexp, axis=1)
+        t_deg  = np.sum(self.deg_base * deg_factor * Pdis, axis=1)
+        t_emi  = np.sum(self.emi * Pimp * self.ctx, axis=1)
+        t_dem  = np.max(Pimp, axis=1) * self.pdc
+        fit = t_eng + t_deg + t_emi + t_dem + pen
+        return float(fit[0]) if is1d else fit
 
 class IAROA:
-    def __init__(
-        self,
-        obj_func: Any,
-        max_iter: int,
-        lb: Any,
-        ub: Any,
-        n_agents: int = 15
-    ) -> None:
-        self.obj_func = obj_func
-        self.max_iter = max_iter
-        self.lb = np.array(lb, dtype=float)
-        self.ub = np.array(ub, dtype=float)
-        self.n_agents = n_agents
-        self.dim = len(lb)
-        self.time_taken = 0.0
+    def __init__(self, ems: MicrogridEMS, max_iter: int = 30, n_agents: int = 12) -> None:
+        self.ems = ems; self.max_iter = max_iter; self.n_agents = n_agents
+        self.lb, self.ub = ems.bounds()
+        self.dim = len(self.lb)
+        self.runtime_ms = 0.0
 
-    def optimize(self) -> tuple:
-        t_start = _time.time()
+    def run(self) -> Tuple[np.ndarray, float, List[float]]:
+        t0 = _time.perf_counter()
         X = np.random.uniform(self.lb, self.ub, (self.n_agents, self.dim))
-        fitness = self.obj_func(X)
-        b_idx = int(np.argmin(fitness))
-        b_sol = X[b_idx].copy()
-        b_fit = float(fitness[b_idx])
-        convergence: List[float] = [b_fit]
-
+        fit = self.ems.fitness(X)
+        bi = int(np.argmin(fit))
+        bsol = X[bi].copy(); bfit = float(fit[bi])
+        conv: List[float] = [bfit]
         for t in range(self.max_iter):
-            A = 4.0 * (1.0 - t / self.max_iter) * math.log(1.0 / max(float(np.random.rand()), 1e-10))
+            A = 4.0 * (1 - t / self.max_iter) * math.log(1 / max(float(np.random.rand()), 1e-9))
             r = np.random.rand(self.n_agents, 1)
-
-            if A > 1.0:
-                j = np.random.randint(0, self.n_agents, size=self.n_agents)
-                X_new = X[j] + r * (X - X[j]) + np.random.randn(self.n_agents, self.dim)
+            if A > 1:
+                j = np.random.randint(0, self.n_agents, self.n_agents)
+                Xn = X[j] + r * (X - X[j]) + np.random.randn(self.n_agents, self.dim) * 0.5
             else:
-                X_new = b_sol + A * np.random.randn(self.n_agents, self.dim) * (b_sol - X)
+                Xn = bsol + A * np.random.randn(self.n_agents, self.dim) * (bsol - X)
+            Xn = np.clip(Xn, self.lb, self.ub)
+            fn = self.ems.fitness(Xn)
+            mask = fn < fit
+            X[mask] = Xn[mask]; fit[mask] = fn[mask]
+            ci = int(np.argmin(fit))
+            if fit[ci] < bfit:
+                bsol = X[ci].copy(); bfit = float(fit[ci])
+            conv.append(bfit)
+        self.runtime_ms = (_time.perf_counter() - t0) * 1000
+        return bsol, bfit, conv
 
-            X_new = np.clip(X_new, self.lb, self.ub)
-            new_fit = self.obj_func(X_new)
-
-            better_mask = new_fit < fitness
-            X[better_mask] = X_new[better_mask]
-            fitness[better_mask] = new_fit[better_mask]
-
-            curr_b_idx = int(np.argmin(fitness))
-            if fitness[curr_b_idx] < b_fit:
-                b_sol = X[curr_b_idx].copy()
-                b_fit = float(fitness[curr_b_idx])
-
-            convergence.append(b_fit)
-
-        self.time_taken = _time.time() - t_start
-        return b_sol, b_fit, convergence
-
-
-# ============================
-# MPC DISPATCH HEURISTIC
-# ============================
-def mpc_dispatch(
-    pv: float,
-    load_val: float,
-    soc: float,
-    imp_price: float,
-    exp_price: float,
-    avg_price: float,
-    bat_cap: float,
-    carbon_intensity: float = 600.0
-) -> tuple:
-    """Single-step MPC dispatch heuristic."""
-    SOC_MIN = 0.2 * bat_cap
-    SOC_MAX = 0.9 * bat_cap
+# ══════════════════════════════════════════════════════════════════════════════
+# HIERARCHICAL MPC (Local → Regional → Global)
+# ══════════════════════════════════════════════════════════════════════════════
+def local_mpc(pv: float, load: float, soc: float, soh: float,
+              imp_price: float, exp_price: float, avg_price: float,
+              bat_cap: float) -> Tuple[float, float, float, float]:
+    """Per-city single-step MPC dispatch."""
+    SOC_MIN = 0.2 * bat_cap; SOC_MAX = 0.9 * bat_cap
     P_BAT_MAX = bat_cap * 0.25
-    ETA_CH = float(OPTIMIZATION_SETTINGS["battery_eta_ch"])
-    ETA_DIS = float(OPTIMIZATION_SETTINGS["battery_eta_dis"])
-    DEG_COST = float(OPTIMIZATION_SETTINGS["deg_cost_per_kwh"])
+    eta_ch = OPT_SETTINGS["battery_eta_ch"]; eta_dis = OPT_SETTINGS["battery_eta_dis"]
+    deg = OPT_SETTINGS["deg_cost_per_kwh"] * (2.0 - soh)
+    net_load = load - pv
+    Pch = Pdis = 0.0
+    if imp_price > avg_price and net_load > 0 and soc > SOC_MIN + 2:
+        if imp_price - deg > 0:
+            Pdis = min(P_BAT_MAX, (soc - SOC_MIN) * eta_dis, net_load)
+    elif imp_price < avg_price * 0.85 and soc < SOC_MAX - 2:
+        if net_load <= 0:
+            Pch = min(P_BAT_MAX, (SOC_MAX - soc) / eta_ch, abs(net_load))
+    final_net = net_load + Pch - Pdis
+    return max(0.0, Pch), max(0.0, Pdis), max(0.0, final_net), max(0.0, -final_net)
 
-    net_load = load_val - pv
-    P_ch, P_dis = 0.0, 0.0
-
-    if imp_price > avg_price and net_load > 0.0 and soc > SOC_MIN + 2.0:
-        savings = imp_price - DEG_COST
-        if savings > 0.0:
-            max_dis_soc = (soc - SOC_MIN) * ETA_DIS
-            P_dis = min(P_BAT_MAX, max_dis_soc, net_load)
-            P_dis = max(0.0, P_dis)
-    elif imp_price < avg_price * 0.85 and soc < SOC_MAX - 2.0:
-        if net_load <= 0.0:
-            max_ch_soc = (SOC_MAX - soc) / ETA_CH
-            max_ch_pv = abs(net_load)
-            P_ch = min(P_BAT_MAX, max_ch_soc, max_ch_pv)
-            P_ch = max(0.0, P_ch)
-
-    final_net = net_load + P_ch - P_dis
-    P_imp = max(0.0, final_net)
-    P_exp = max(0.0, -final_net)
-
-    return P_ch, P_dis, P_imp, P_exp
-
-
-# ============================
-# PEER-TO-PEER ENERGY TRADING
-# ============================
-def compute_p2p_trades(city_results: Dict[str, Dict[str, float]]) -> List[Dict[str, Any]]:
-    """After optimizing each city, compute peer-to-peer energy trades."""
-    # FIX: Use separate mutable copies to avoid aliasing issues
-    surplus_cities: Dict[str, float] = {}
-    deficit_cities: Dict[str, float] = {}
-
-    for cid, res in city_results.items():
-        tot_gen = float(res.get("tot_gen_now", 0.0))
-        load_now = float(res.get("load_now", 0.0))
-        net = tot_gen - load_now
-        if net > 0.5:
-            surplus_cities[cid] = round(net, 2)
-        elif net < -0.5:
-            deficit_cities[cid] = round(abs(net), 2)
-
-    # FIX: Work on copies to prevent mutation during iteration
-    surplus_avail: Dict[str, float] = dict(surplus_cities)
-    deficit_need: Dict[str, float] = dict(deficit_cities)
-
+def regional_mpc(cluster_id: str, city_results: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
+    """Cluster-level coordination: balance net loads, enable intra-cluster P2P."""
+    members = CLUSTERS[cluster_id]
+    cluster_net = sum(city_results[c]["net_kw"] for c in members if c in city_results)
     trades: List[Dict[str, Any]] = []
+    surplus = {c: city_results[c]["surplus"] for c in members
+               if c in city_results and city_results[c]["surplus"] > 0.5}
+    deficit = {c: city_results[c]["deficit"] for c in members
+               if c in city_results and city_results[c]["deficit"] > 0.5}
+    sur_copy = dict(surplus); def_copy = dict(deficit)
+    for dc in sorted(def_copy, key=lambda x: -def_copy[x]):
+        rem = def_copy[dc]
+        for sc in sorted(sur_copy, key=lambda x: -sur_copy[x]):
+            if rem <= 0.1: break
+            avail = sur_copy.get(sc, 0)
+            if avail <= 0.1: continue
+            traded = min(rem, avail)
+            trades.append({"from": sc, "to": dc, "amount_kw": round(traded, 2),
+                            "price_inr": round(traded * OPT_SETTINGS["p2p_price_inr_per_kwh"], 2),
+                            "scope": "regional"})
+            sur_copy[sc] -= traded; rem -= traded
+    return {"cluster": cluster_id, "cluster_net_kw": round(cluster_net, 2), "intra_trades": trades}
 
-    for d_city in sorted(deficit_need, key=lambda c: -deficit_need[c]):
-        remaining = deficit_need[d_city]
-        for s_city in sorted(surplus_avail, key=lambda c: -surplus_avail[c]):
-            if remaining <= 0.1:
-                break
-            avail = surplus_avail.get(s_city, 0.0)
-            if avail <= 0.1:
-                continue
-            traded = min(remaining, avail)
-            trades.append({
-                "from": s_city,
-                "to": d_city,
-                "amount_kw": round(traded, 2),
-                "price_inr": round(traded * 5.0, 2),
-            })
-            surplus_avail[s_city] = avail - traded
-            remaining -= traded
+def global_mpc(cluster_summaries: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Global grid balancing: cross-cluster P2P arbitrage."""
+    net = {c: s["cluster_net_kw"] for c, s in cluster_summaries.items()}
+    total_net = sum(net.values())
+    grid_import = max(0, -total_net)
+    grid_export = max(0, total_net)
+    cross_trades: List[Dict[str, Any]] = []
+    sur_c = {c: v for c, v in net.items() if v > 0.5}
+    def_c = {c: -v for c, v in net.items() if v < -0.5}
+    sc_copy = dict(sur_c); dc_copy = dict(def_c)
+    for dc in sorted(dc_copy, key=lambda x: -dc_copy[x]):
+        rem = dc_copy[dc]
+        for sc in sorted(sc_copy, key=lambda x: -sc_copy[x]):
+            if rem <= 0.1: break
+            avail = sc_copy.get(sc, 0)
+            if avail <= 0.1: continue
+            traded = min(rem, avail)
+            price = OPT_SETTINGS["p2p_price_inr_per_kwh"] * 1.1  # slight premium cross-cluster
+            cross_trades.append({"from": sc, "to": dc, "amount_kw": round(traded, 2),
+                                  "price_inr": round(traded * price, 2), "scope": "global"})
+            sc_copy[sc] -= traded; rem -= traded
+    return {
+        "total_net_kw": round(total_net, 2),
+        "grid_import_kw": round(grid_import, 2),
+        "grid_export_kw": round(grid_export, 2),
+        "cross_cluster_trades": cross_trades,
+        "balance_achieved": abs(total_net) < 5.0,
+    }
 
-    return trades
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def _cost_carbon(pimp: float, pexp: float, pdis: float,
+                 imp_p: float, exp_p: float, soh: float) -> Tuple[float, float]:
+    deg = degradation_cost(pdis, soh)
+    cost = (imp_p * pimp - exp_p * pexp + deg
+            + OPT_SETTINGS["grid_emission_factor"] * pimp * OPT_SETTINGS["carbon_tax"])
+    carbon = OPT_SETTINGS["grid_emission_factor"] * pimp
+    return float(cost), float(carbon)
 
+def _default_dates() -> Tuple[str, str]:
+    sd = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
+    ed = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    return sd, ed
 
-# ============================
-# COMMUNICATION LINKS (MESH)
-# ============================
-def get_communication_links() -> List[Dict[str, Any]]:
-    """All peer-to-peer communication links (full mesh)."""
-    city_ids = list(CITIES.keys())
-    links: List[Dict[str, Any]] = []
-    for i in range(len(city_ids)):
-        for j in range(i + 1, len(city_ids)):
-            links.append({
-                "from": city_ids[i],
-                "to": city_ids[j],
-                "latency_ms": round(float(np.random.uniform(5, 25)), 1),
-                "status": "active"
-            })
-    return links
-
-
-# ============================
-# HELPER: compute cost & carbon
-# ============================
-def _compute_cost_carbon(
-    imp_price_now: float,
-    exp_price_now: float,
-    P_imp: float,
-    P_exp: float,
-    P_dis: float
-) -> tuple:
-    deg_cost = float(OPTIMIZATION_SETTINGS["deg_cost_per_kwh"])
-    emi_factor = float(OPTIMIZATION_SETTINGS["grid_emission_factor"])
-    carb_tax = float(OPTIMIZATION_SETTINGS["carbon_tax"])
-
-    cost = (imp_price_now * P_imp
-            - exp_price_now * P_exp
-            + deg_cost * P_dis
-            + emi_factor * P_imp * carb_tax)
-    carbon = emi_factor * P_imp
-    return cost, carbon
-
-
-# ============================
+# ══════════════════════════════════════════════════════════════════════════════
 # API ENDPOINTS
-# ============================
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/cities")
-def get_cities(
-    start_date: Optional[str] = Query(None),
-    end_date: Optional[str] = Query(None)
-) -> Dict[str, Any]:
-    """Return all 5 city configs and current states."""
-    # FIX: Validate that start_date is a proper string
-    if not isinstance(start_date, str) or not start_date:
-        start_dt = datetime.now() - timedelta(days=2)
-        start_date = start_dt.strftime("%Y-%m-%d")
-
-    if not isinstance(end_date, str) or not end_date:
-        dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_date = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    # FIX: current hour used consistently for live data alignment
-    current_hour = datetime.now().hour
-
-    result: List[Dict[str, Any]] = []
+def get_cities(start_date: Optional[str] = Query(None),
+               end_date: Optional[str] = Query(None)) -> Dict[str, Any]:
+    sd, ed = (start_date, end_date) if start_date and end_date else _default_dates()
+    ch = datetime.now().hour
+    out = []
     for cid, cfg in CITIES.items():
-        pv_fc, wind_fc, thermal_fc = generate_generation_forecasts(
-            cid, 1, start_hour=current_hour, start_date=start_date, end_date=end_date
-        )
-        load_fc = generate_dynamic_load_forecast(
-            cid, 1, start_hour=current_hour, start_date=start_date, end_date=end_date
-        )
-
-        pv_now = float(pv_fc[0])
-        wind_now = float(wind_fc[0])
-        thermal_now = float(thermal_fc[0])
-        load_now = float(load_fc[0])
-        tot_gen = round(pv_now + wind_now + thermal_now, 2)
-
-        state = city_states.get(cid, {})
-        bat_cap = float(cfg["bat_cap_kwh"])
-        soc_kwh = float(state.get("soc_kwh", float(cfg["initial_soc_pct"]) * bat_cap))
-
-        # FIX: Use current_hour index for weather (not index 0)
-        weather = get_weather_data(cid, start_date, end_date)
-        temps: List[float] = weather["temps"]
-        winds: List[float] = weather["winds"]
-        current_temp = round(temps[current_hour % len(temps)], 1) if temps else 25.0
-        current_wind = round(winds[current_hour % len(winds)], 1) if winds else 5.0
-
-        result.append({
-            "id": cid,
-            "name": cfg["name"],
-            "lat": cfg["lat"],
-            "lon": cfg["lon"],
-            "pv_capacity_kw": cfg["pv_capacity_kw"],
-            "wind_capacity_kw": cfg["wind_capacity_kw"],
-            "thermal_capacity_kw": cfg["thermal_capacity_kw"],
-            "houses_count": cfg["houses_count"],
-            "buildings_count": cfg["buildings_count"],
-            "bat_cap_kwh": bat_cap,
-            "grid_zone": cfg["grid_zone"],
-            "climate": cfg["climate"],
-            "pv_now_kw": pv_now,
-            "wind_now_kw": wind_now,
-            "thermal_now_kw": thermal_now,
-            "tot_gen_kw": tot_gen,
-            "load_now_kw": load_now,
-            "current_temp_c": current_temp,
-            "current_wind_mps": current_wind,
-            "soc_kwh": round(soc_kwh, 2),
-            "soc_pct": round(soc_kwh / bat_cap * 100.0, 1),
-            "net_power_kw": round(tot_gen - load_now, 2),
-            "status": (
-                "surplus" if tot_gen > load_now
-                else ("deficit" if load_now > tot_gen + 1.0 else "balanced")
-            ),
+        wx = get_weather(cid, sd, ed)
+        pv, wind, therm = gen_forecasts(cid, ch, 1, wx)
+        ld = load_forecast(cid, ch, 1, wx)
+        state = city_states[cid]
+        bat_cap = cfg["bat_cap"]
+        soc = state["soc_kwh"]
+        soh = state["soh"]
+        gen = float(pv[0] + wind[0] + therm[0])
+        load = float(ld[0])
+        out.append({
+            "id": cid, "name": cfg["name"], "cluster": cfg["cluster"],
+            "lat": cfg["lat"], "lon": cfg["lon"],
+            "pv_cap": cfg["pv_cap"], "wind_cap": cfg["wind_cap"],
+            "thermal_cap": cfg["thermal_cap"], "bat_cap": bat_cap,
+            "pv_now": round(float(pv[0]), 2), "wind_now": round(float(wind[0]), 2),
+            "thermal_now": round(float(therm[0]), 2),
+            "gen_total": round(gen, 2), "load_now": round(load, 2),
+            "net_kw": round(gen - load, 2),
+            "surplus": float(round(max(0.0, gen - load), 2)),
+            "deficit": float(round(max(0.0, load - gen), 2)),
+            "temp_c": round(float(wx["temps"][ch % len(wx["temps"])]), 1),
+            "wind_mps": round(float(wx["winds"][ch % len(wx["winds"])]), 1),
+            "soc_kwh": round(soc, 2), "soc_pct": round(soc / bat_cap * 100, 1),
         })
-
     return {
-        "cities": result,
-        "communication_links": get_communication_links(),
+        "cities": out,
+        "clusters": {cl: {"members": m} for cl, m in CLUSTERS.items()},
         "timestamp": _time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
+@app.get("/weather/{city_id}")
+def get_city_weather(city_id: str,
+                     start_date: Optional[str] = Query(None),
+                     end_date: Optional[str] = Query(None)) -> Dict[str, Any]:
+    if city_id not in CITIES:
+        return {"error": "Unknown city"}
+    sd, ed = (start_date, end_date) if start_date and end_date else _default_dates()
+    wx = get_weather(city_id, sd, ed)
+    n = min(48, wx["n_hours"])
+    return {
+        "city": CITIES[city_id]["name"], "start_date": sd, "end_date": ed,
+        "historical": {
+            "temperature_2m":       wx["temps"][:n].tolist(),
+            "wind_speed_10m":       wx["winds"][:n].tolist(),
+            "shortwave_radiation":  wx["solar"][:n].tolist(),
+            "relative_humidity_2m": wx["humidity"][:n].tolist(),
+            "cloud_cover":          wx["cloud_cover"][:n].tolist(),
+            "precipitation":        wx["precipitation"][:n].tolist(),
+        },
+        "forecast": {
+            "temperature_2m":      wx["fcast_temps"][:48].tolist(),
+            "wind_speed_10m":      wx["fcast_winds"][:48].tolist(),
+            "shortwave_radiation": wx["fcast_solar"][:48].tolist(),
+        },
+    }
 
-@app.post("/optimize-decentralized")
-def optimize_decentralized(
-    start_date: Optional[str] = Query(None),
-    end_date: Optional[str] = Query(None)
-) -> Dict[str, Any]:
-    """Run IAROA-only and IAROA+MPC for all 5 cities, return comparison."""
-    if not isinstance(start_date, str) or not start_date:
-        start_dt = datetime.now() - timedelta(days=2)
-        start_date = start_dt.strftime("%Y-%m-%d")
+@app.get("/forecast")
+def get_forecast_legacy():
+    # Backwards compatibility for App.jsx - return Delhi as default
+    sd, ed = _default_dates()
+    wx = get_weather("delhi", sd, ed)
+    pv, _, _ = gen_forecasts("delhi", datetime.now().hour, 24, wx)
+    return {
+        "pv_forecast_24h": pv.tolist(),
+        "source": "simulated_legacy"
+    }
 
-    if not isinstance(end_date, str) or not end_date:
-        end_date = (datetime.strptime(start_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+@app.get("/carbon")
+def get_carbon_legacy():
+    # Backwards compatibility for App.jsx
+    return {
+        "carbon_intensity_gco2_kwh": OPT_SETTINGS["grid_emission_factor"] * 1000,
+        "source": "simulated_legacy",
+        "zone": "IN-WE"
+    }
 
-    current_hour = datetime.now().hour
-    H = 24
+@app.post("/optimize")
+def optimize(start_date: Optional[str] = Query(None),
+             end_date: Optional[str] = Query(None)) -> Dict[str, Any]:
+    """Run IAROA + hierarchical MPC for all 9 cities."""
+    sd, ed = (start_date, end_date) if start_date and end_date else _default_dates()
+    ch = datetime.now().hour; H = 24
 
-    iora_results: Dict[str, Any] = {}
-    mpc_results: Dict[str, Any] = {}
-    iora_total_cost = 0.0
-    mpc_total_cost = 0.0
-    iora_total_carbon = 0.0
-    mpc_total_carbon = 0.0
-    iora_total_time = 0.0
-    mpc_total_time = 0.0
-    iora_convergences: Dict[str, List[float]] = {}
-
-    # FIX: city_opt_results now includes soc_pct and soc_kwh
-    city_opt_results: Dict[str, Dict[str, float]] = {}
+    t_wall = _time.perf_counter()
+    iaroa_res: Dict[str, Any] = {}
+    mpc_res:   Dict[str, Any] = {}
+    city_opt:  Dict[str, Dict[str, float]] = {}
+    perf: Dict[str, Dict[str, float]] = {}
+    iaroa_total = {"cost": 0.0, "carbon": 0.0, "time_ms": 0.0}
+    mpc_total   = {"cost": 0.0, "carbon": 0.0, "time_ms": 0.0}
+    cluster_city_res: Dict[str, Dict[str, Dict[str, float]]] = {c: {} for c in CLUSTERS}
 
     for cid, cfg in CITIES.items():
-        pv_fc, wind_fc, thermal_fc = generate_generation_forecasts(
-            cid, H, start_hour=current_hour, start_date=start_date, end_date=end_date
-        )
-        load_fc = generate_dynamic_load_forecast(
-            cid, H, start_hour=current_hour, start_date=start_date, end_date=end_date
-        )
-        imp_price, exp_price = get_city_pricing(cid, H, start_hour=current_hour)
-        soc = float(city_states[cid]["soc_kwh"])
-        bat_cap = float(cfg["bat_cap_kwh"])
-        pv_cap = float(cfg["pv_capacity_kw"] + cfg["wind_capacity_kw"] + cfg["thermal_capacity_kw"])
+        wx = get_weather(cid, sd, ed)
+        pv, wind, therm = gen_forecasts(cid, ch, H, wx)
+        ld = load_forecast(cid, ch, H, wx)
+        imp_p, exp_p = city_pricing(cid, ch, H)
+        state = city_states[cid]
+        soc = state["soc_kwh"]; soh = state["soh"]
+        bat_cap = float(cfg["bat_cap"])
+        pv_cap = float(cfg["pv_cap"] + cfg["wind_cap"] + cfg["thermal_cap"])
+        gen_fc = (pv + wind + therm).astype(np.float32)
+        pv_now = float(pv[0]); wind_now = float(wind[0]); therm_now = float(therm[0])
+        gen_now = float(gen_fc[0]); load_now = float(ld[0])
+        avg_p = float(np.mean(imp_p))
 
-        weather = get_weather_data(cid, start_date=start_date, end_date=end_date)
-        temps: List[float] = weather["temps"]
-        winds: List[float] = weather["winds"]
-        current_temp = round(temps[current_hour % len(temps)], 1) if temps else 25.0
-        current_wind_val = round(winds[current_hour % len(winds)], 1) if winds else 5.0
+        # ── IAROA ──────────────────────────────────────────────────────────
+        t0 = _time.perf_counter()
+        ems = MicrogridEMS(gen_fc, ld, imp_p, exp_p, soc, bat_cap, pv_cap, soh)
+        opt = IAROA(ems, max_iter=30, n_agents=12)
+        bsol, bfit, conv = opt.run()
+        iaroa_ms = opt.runtime_ms
+        H_ = H
+        Pch_i = float(bsol[0]); Pdis_i = float(bsol[H_])
+        net_i = load_now + Pch_i - gen_now - Pdis_i
+        Pimp_i = max(0, net_i); Pexp_i = max(0, -net_i)
+        cost_i, carbon_i = _cost_carbon(Pimp_i, Pexp_i, Pdis_i, float(imp_p[0]), float(exp_p[0]), soh)
+        iaroa_res[cid] = {
+            "city": cfg["name"], "cluster": cfg["cluster"],
+            "cost_inr": round(cost_i, 2), "carbon_kg": round(carbon_i, 4),
+            "import_kw": round(Pimp_i, 2), "export_kw": round(Pexp_i, 2),
+            "charge_kw": round(Pch_i, 2), "discharge_kw": round(Pdis_i, 2),
+            "fitness": round(bfit, 2), "iterations": len(conv),
+            "time_ms": round(iaroa_ms, 1), "convergence": conv[-10:],
+        }
+        iaroa_total["cost"] += cost_i; iaroa_total["carbon"] += carbon_i
+        iaroa_total["time_ms"] += iaroa_ms
 
-        tot_gen_fc = [round(float(pv_fc[h] + wind_fc[h] + thermal_fc[h]), 2) for h in range(H)]
+        # ── Local MPC ──────────────────────────────────────────────────────
+        t0 = _time.perf_counter()
+        Pch_m, Pdis_m, Pimp_m, Pexp_m = local_mpc(
+            gen_now, load_now, soc, soh, float(imp_p[0]), float(exp_p[0]), avg_p, bat_cap)
+        mpc_ms = (_time.perf_counter() - t0) * 1000
+        cost_m, carbon_m = _cost_carbon(Pimp_m, Pexp_m, Pdis_m, float(imp_p[0]), float(exp_p[0]), soh)
+        mpc_res[cid] = {
+            "city": cfg["name"], "cluster": cfg["cluster"],
+            "cost_inr": round(cost_m, 2), "carbon_kg": round(carbon_m, 4),
+            "import_kw": round(Pimp_m, 2), "export_kw": round(Pexp_m, 2),
+            "charge_kw": round(Pch_m, 2), "discharge_kw": round(Pdis_m, 2),
+            "time_ms": round(mpc_ms, 1),
+        }
+        mpc_total["cost"] += cost_m; mpc_total["carbon"] += carbon_m
+        mpc_total["time_ms"] += mpc_ms
 
-        pv_now = float(pv_fc[0])
-        wind_now = float(wind_fc[0])
-        thermal_now = float(thermal_fc[0])
-        tot_gen_now = float(tot_gen_fc[0])
-        load_now = float(load_fc[0])
+        # State of health update
+        new_soh, cycles_add = update_soh(soh, Pch_m, Pdis_m, bat_cap)
+        new_soc = float(np.clip(
+            soc + OPT_SETTINGS["battery_eta_ch"] * Pch_m - Pdis_m / OPT_SETTINGS["battery_eta_dis"],
+            0.2 * bat_cap, 0.9 * bat_cap))
+        city_states[cid]["soc_kwh"] = new_soc
+        city_states[cid]["soh"] = new_soh
+        city_states[cid]["cycles"] += cycles_add
+        city_states[cid]["cumulative_cost"] += cost_m
+        city_states[cid]["cumulative_carbon"] += carbon_m
 
-        # FIX: Include soc info in city_opt_results so P2P logic can reference it
-        city_opt_results[cid] = {
-            "pv_now": pv_now,
-            "wind_now": wind_now,
-            "thermal_now": thermal_now,
-            "tot_gen_now": tot_gen_now,
-            "load_now": load_now,
-            "soc_pct": round(soc / bat_cap * 100.0, 1),
-            "soc_kwh": soc,
-            "current_temp_c": current_temp,
-            "current_wind_mps": current_wind_val,
+        surplus = max(0, gen_now - load_now)
+        deficit = max(0, load_now - gen_now)
+        city_opt[cid] = {
+            "gen_now": gen_now, "load_now": load_now,
+            "pv_now": pv_now, "wind_now": wind_now, "thermal_now": therm_now,
+            "surplus": surplus, "deficit": deficit,
+            "net_kw": round(gen_now - load_now, 2),
+            "soc_pct": round(new_soc / bat_cap * 100, 1), "soh": round(new_soh, 4),
+        }
+        cluster_city_res[cfg["cluster"]][cid] = city_opt[cid]
+
+        perf[cid] = {
+            "iaroa_ms": round(iaroa_ms, 1), "mpc_ms": round(mpc_ms, 3),
+            "total_ms": round(iaroa_ms + mpc_ms, 1),
+            "iterations": len(conv),
+            "fitness_initial": round(conv[0], 2),
+            "fitness_final": round(conv[-1], 2),
+            "improvement_pct": round((1 - conv[-1] / max(abs(conv[0]), 1e-9)) * 100, 1),
         }
 
-        # ---- IAROA-ONLY ----
-        t0 = _time.time()
-        ems = MicrogridEMS(tot_gen_fc, load_fc, imp_price, exp_price, soc, bat_cap, pv_cap)
-        lb, ub = ems.get_bounds()
-        optimizer = IAROA(ems.fitness_function, max_iter=30, lb=lb, ub=ub, n_agents=12)
-        best_sol, best_fit, convergence = optimizer.optimize()
-        iora_time = (_time.time() - t0) * 1000.0
+    # ── Regional MPC ───────────────────────────────────────────────────────
+    t_reg = _time.perf_counter()
+    regional: Dict[str, Any] = {}
+    for cl in CLUSTERS:
+        regional[cl] = regional_mpc(cl, cluster_city_res[cl])
+    regional_ms = (_time.perf_counter() - t_reg) * 1000
 
-        P_ch_iora = float(best_sol[0])
-        P_dis_iora = float(best_sol[H])
-        net_iora = load_now + P_ch_iora - tot_gen_now - P_dis_iora
-        P_imp_iora = max(0.0, net_iora)
-        P_exp_iora = max(0.0, -net_iora)
+    # ── Global MPC ─────────────────────────────────────────────────────────
+    t_glob = _time.perf_counter()
+    global_res = global_mpc(regional)
+    global_ms = (_time.perf_counter() - t_glob) * 1000
 
-        cost_iora, carbon_iora = _compute_cost_carbon(
-            imp_price[0], exp_price[0], P_imp_iora, P_exp_iora, P_dis_iora
-        )
+    wall_ms = (_time.perf_counter() - t_wall) * 1000
 
-        iora_results[cid] = {
-            "city": cfg["name"],
-            "cost_inr": round(cost_iora, 2),
-            "carbon_kg": round(carbon_iora, 2),
-            "import_kw": round(P_imp_iora, 2),
-            "export_kw": round(P_exp_iora, 2),
-            "charge_kw": round(P_ch_iora, 2),
-            "discharge_kw": round(P_dis_iora, 2),
-            "fitness": round(float(best_fit), 2),
-            "iterations": len(convergence),
-            "computation_ms": round(iora_time, 1),
-        }
-        iora_total_cost += cost_iora
-        iora_total_carbon += carbon_iora
-        iora_total_time += iora_time
-        iora_convergences[cid] = convergence
-
-        # ---- IAROA + MPC ----
-        t0 = _time.time()
-        ems2 = MicrogridEMS(tot_gen_fc, load_fc, imp_price, exp_price, soc, bat_cap, pv_cap)
-        lb2, ub2 = ems2.get_bounds()
-        optimizer2 = IAROA(ems2.fitness_function, max_iter=30, lb=lb2, ub=ub2, n_agents=12)
-        best_sol2, best_fit2, conv2 = optimizer2.optimize()
-
-        avg_price = float(np.mean(imp_price))
-        P_ch_mpc, P_dis_mpc, P_imp_mpc, P_exp_mpc = mpc_dispatch(
-            tot_gen_now, load_now, soc, imp_price[0], exp_price[0], avg_price, bat_cap
-        )
-        mpc_time = (_time.time() - t0) * 1000.0
-
-        cost_mpc, carbon_mpc = _compute_cost_carbon(
-            imp_price[0], exp_price[0], P_imp_mpc, P_exp_mpc, P_dis_mpc
-        )
-
-        mpc_results[cid] = {
-            "city": cfg["name"],
-            "cost_inr": round(cost_mpc, 2),
-            "carbon_kg": round(carbon_mpc, 2),
-            "import_kw": round(P_imp_mpc, 2),
-            "export_kw": round(P_exp_mpc, 2),
-            "charge_kw": round(P_ch_mpc, 2),
-            "discharge_kw": round(P_dis_mpc, 2),
-            "fitness": round(float(best_fit2), 2),
-            "iterations": len(conv2),
-            "computation_ms": round(mpc_time, 1),
-        }
-        mpc_total_cost += cost_mpc
-        mpc_total_carbon += carbon_mpc
-        mpc_total_time += mpc_time
-
-        # Update city state with MPC dispatch outcome
-        eta_ch = float(OPTIMIZATION_SETTINGS["battery_eta_ch"])
-        eta_dis = float(OPTIMIZATION_SETTINGS["battery_eta_dis"])
-        new_soc = soc + eta_ch * P_ch_mpc - P_dis_mpc / eta_dis
-        city_states[cid]["soc_kwh"] = max(0.2 * bat_cap, min(0.9 * bat_cap, new_soc))
-        city_states[cid]["last_pv_kw"] = pv_now
-        city_states[cid]["last_wind_kw"] = wind_now
-        city_states[cid]["last_thermal_kw"] = thermal_now
-        city_states[cid]["last_load_kw"] = load_now
-        city_states[cid]["last_import_kw"] = P_imp_mpc
-        city_states[cid]["last_export_kw"] = P_exp_mpc
-        city_states[cid]["surplus_kw"] = max(0.0, tot_gen_now - load_now)
-        city_states[cid]["deficit_kw"] = max(0.0, load_now - tot_gen_now)
-
-    trades = compute_p2p_trades(city_opt_results)
-
-    iora_cost_saving = iora_total_cost - mpc_total_cost
-    carbon_saving = iora_total_carbon - mpc_total_carbon
+    cost_saving = iaroa_total["cost"] - mpc_total["cost"]
+    carbon_saving = iaroa_total["carbon"] - mpc_total["carbon"]
 
     return {
-        "iora_only": {
-            "per_city": iora_results,
-            "total_cost_inr": round(iora_total_cost, 2),
-            "total_carbon_kg": round(iora_total_carbon, 2),
-            "total_computation_ms": round(iora_total_time, 1),
+        "iaroa": {
+            "per_city": iaroa_res,
+            "total_cost_inr": round(iaroa_total["cost"], 2),
+            "total_carbon_kg": round(iaroa_total["carbon"], 4),
+            "total_time_ms": round(iaroa_total["time_ms"], 1),
         },
-        "iora_mpc": {
-            "per_city": mpc_results,
-            "total_cost_inr": round(mpc_total_cost, 2),
-            "total_carbon_kg": round(mpc_total_carbon, 2),
-            "total_computation_ms": round(mpc_total_time, 1),
+        "mpc": {
+            "per_city": mpc_res,
+            "total_cost_inr": round(mpc_total["cost"], 2),
+            "total_carbon_kg": round(mpc_total["carbon"], 4),
+            "total_time_ms": round(mpc_total["time_ms"], 1),
         },
-        "p2p_trades": trades,
+        "hierarchical_mpc": {
+            "local":    {cid: {"Pch": round(mpc_res[cid]["charge_kw"], 2),
+                               "Pdis": round(mpc_res[cid]["discharge_kw"], 2)} for cid in mpc_res},
+            "regional": regional,
+            "global":   global_res,
+            "regional_time_ms": round(regional_ms, 3),
+            "global_time_ms": round(global_ms, 3),
+        },
         "comparison": {
-            "cost_saving_inr": round(iora_cost_saving, 2),
-            "carbon_saving_kg": round(carbon_saving, 2),
-            "mpc_overhead_ms": round(mpc_total_time - iora_total_time, 1),
-            "verdict": "IAROA+MPC" if mpc_total_cost <= iora_total_cost else "IAROA-Only",
-            "verdict_reason": (
-                f"IAROA+MPC saves ₹{abs(iora_cost_saving):.1f} with MPC real-time correction"
-                if mpc_total_cost <= iora_total_cost
-                else f"IAROA-Only is ₹{abs(iora_cost_saving):.1f} cheaper without MPC overhead"
-            ),
+            "cost_saving_inr": round(cost_saving, 2),
+            "carbon_saving_kg": round(carbon_saving, 4),
+            "verdict": "IAROA+MPC" if mpc_total["cost"] <= iaroa_total["cost"] else "IAROA-Only",
         },
-        "communication_links": get_communication_links(),
-        "convergences": {cid: conv[-5:] for cid, conv in iora_convergences.items()},
+        "performance": {
+            "per_city": perf,
+            "total_wall_ms": round(wall_ms, 1),
+            "avg_city_ms": round(wall_ms / len(CITIES), 1),
+            "regional_ms": round(regional_ms, 3),
+            "global_ms": round(global_ms, 3),
+        },
+        "city_opt": city_opt,
         "timestamp": _time.strftime("%Y-%m-%d %H:%M:%S"),
     }
-
 
 @app.post("/simulate-24h")
-def simulate_24h(
-    start_date: Optional[str] = Query(None),
-    end_date: Optional[str] = Query(None)
-) -> Dict[str, Any]:
-    """Run a full 24-hour simulation using historical data and return hourly results."""
-    if not isinstance(start_date, str) or not start_date:
-        start_dt = datetime.now() - timedelta(days=2)
-        start_date = start_dt.strftime("%Y-%m-%d")
-
-    if not isinstance(end_date, str) or not end_date:
-        dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_date = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
-
+def simulate_24h(start_date: Optional[str] = Query(None),
+                 end_date: Optional[str] = Query(None)) -> Dict[str, Any]:
+    sd, ed = (start_date, end_date) if start_date and end_date else _default_dates()
     H = 24
-    simulation_results: List[Dict[str, Any]] = []
-
-    # FIX: Independent SOC tracker for simulation (does not mutate global city_states)
-    sim_socs: Dict[str, float] = {
-        cid: float(CITIES[cid]["initial_soc_pct"]) * float(CITIES[cid]["bat_cap_kwh"])
-        for cid in CITIES
-    }
-
+    sim_soc = {cid: float(CITIES[cid]["init_soc"]) * float(CITIES[cid]["bat_cap"]) for cid in CITIES}
+    sim_soh = {cid: 1.0 for cid in CITIES}
+    sim_cycles = {cid: 0.0 for cid in CITIES}
+    results = []
     for hour_idx in range(24):
-        # FIX: Explicitly typed hour_results to prevent Any-indexing confusion
-        iora_hour: Dict[str, Any] = {
-            "per_city": {},
-            "total_cost_inr": 0.0,
-            "total_carbon_kg": 0.0,
-            "total_computation_ms": 0.0
-        }
-        mpc_hour: Dict[str, Any] = {
-            "per_city": {},
-            "total_cost_inr": 0.0,
-            "total_carbon_kg": 0.0,
-            "total_computation_ms": 0.0
-        }
-        city_opt_res: Dict[str, Dict[str, float]] = {}
-
+        hour_data: Dict[str, Any] = {"hour": hour_idx, "cities": {}, "hierarchical": {}, "totals": {}, "performance": {}}
+        cluster_city_res: Dict[str, Dict[str, Dict[str, float]]] = {c: {} for c in CLUSTERS}
+        total_iaroa_cost = total_mpc_cost = 0.0
+        total_iaroa_carbon = total_mpc_carbon = 0.0
+        total_ms = 0.0
+        
         for cid, cfg in CITIES.items():
-            pv_fc, wind_fc, thermal_fc = generate_generation_forecasts(
-                cid, H, start_hour=hour_idx, start_date=start_date, end_date=end_date
-            )
-            load_fc = generate_dynamic_load_forecast(
-                cid, H, start_hour=hour_idx, start_date=start_date, end_date=end_date
-            )
-            imp_price, exp_price = get_city_pricing(cid, H, start_hour=hour_idx)
+            wx = get_weather(cid, sd, ed)
+            pv, wind, therm = gen_forecasts(cid, hour_idx, H, wx)
+            ld = load_forecast(cid, hour_idx, H, wx)
+            imp_p, exp_p = city_pricing(cid, hour_idx, H)
+            soc = sim_soc[cid]; soh = sim_soh[cid]
+            bat_cap = float(cfg["bat_cap"])
+            pv_cap = float(cfg["pv_cap"] + cfg["wind_cap"] + cfg["thermal_cap"])
+            gen_fc = (pv + wind + therm).astype(np.float32)
+            gen_now = float(gen_fc[0]); load_now = float(ld[0])
+            avg_p = float(np.mean(imp_p))
 
-            soc = float(sim_socs[cid])
-            bat_cap = float(cfg["bat_cap_kwh"])
-            pv_cap = float(cfg["pv_capacity_kw"] + cfg["wind_capacity_kw"] + cfg["thermal_capacity_kw"])
+            t0 = _time.perf_counter()
+            ems = MicrogridEMS(gen_fc, ld, imp_p, exp_p, soc, bat_cap, pv_cap, soh)
+            opt = IAROA(ems, max_iter=15, n_agents=8)
+            bsol, bfit, conv = opt.run()
+            iaroa_ms = opt.runtime_ms
+            Pimp_i = max(0, load_now + float(bsol[0]) - gen_now - float(bsol[H]))
+            Pexp_i = max(0, -(load_now + float(bsol[0]) - gen_now - float(bsol[H])))
+            cost_i, carbon_i = _cost_carbon(Pimp_i, Pexp_i, float(bsol[H]),
+                                             float(imp_p[0]), float(exp_p[0]), soh)
 
-            tot_gen_fc = [round(float(pv_fc[h] + wind_fc[h] + thermal_fc[h]), 2) for h in range(H)]
+            t0m = _time.perf_counter()
+            Pch_m, Pdis_m, Pimp_m, Pexp_m = local_mpc(
+                gen_now, load_now, soc, soh, float(imp_p[0]), float(exp_p[0]), avg_p, bat_cap)
+            mpc_ms = (_time.perf_counter() - t0m) * 1000
+            cost_m, carbon_m = _cost_carbon(Pimp_m, Pexp_m, Pdis_m,
+                                             float(imp_p[0]), float(exp_p[0]), soh)
 
-            pv_now = float(pv_fc[0])
-            wind_now = float(wind_fc[0])
-            thermal_now = float(thermal_fc[0])
-            tot_gen_now = float(tot_gen_fc[0])
-            load_now = float(load_fc[0])
+            new_soh, cycles_add = update_soh(soh, Pch_m, Pdis_m, bat_cap)
+            new_soc = float(np.clip(
+                soc + OPT_SETTINGS["battery_eta_ch"] * Pch_m - Pdis_m / OPT_SETTINGS["battery_eta_dis"],
+                0.2 * bat_cap, 0.9 * bat_cap))
+            sim_soc[cid] = new_soc; sim_soh[cid] = new_soh
+            sim_cycles[cid] += cycles_add
 
-            # FIX: Use hour_idx for weather array access, with bounds check
-            weather = get_weather_data(cid, start_date=start_date, end_date=end_date)
-            temps: List[float] = weather["temps"]
-            winds: List[float] = weather["winds"]
-            current_temp = round(temps[hour_idx % len(temps)], 1) if temps else 25.0
-            current_wind_val = round(winds[hour_idx % len(winds)], 1) if winds else 5.0
+            total_iaroa_cost += cost_i; total_mpc_cost += cost_m
+            total_iaroa_carbon += carbon_i; total_mpc_carbon += carbon_m
+            total_ms += iaroa_ms + mpc_ms
 
-            city_opt_res[cid] = {
-                "pv_now": pv_now,
-                "wind_now": wind_now,
-                "thermal_now": thermal_now,
-                "tot_gen_now": tot_gen_now,
-                "load_now": load_now,
-                "soc_pct": round(soc / bat_cap * 100.0, 1),
-                "soc_kwh": soc,
-                "current_temp_c": current_temp,
-                "current_wind_mps": current_wind_val,
+            perf_cid = {
+                "iaroa_ms": round(iaroa_ms, 1), "mpc_ms": round(mpc_ms, 3),
+                "total_ms": round(iaroa_ms + mpc_ms, 1),
             }
 
-            curr_imp_p = float(imp_price[0])
-            curr_exp_p = float(exp_price[0])
-
-            # ---- IAROA-ONLY ----
-            ems = MicrogridEMS(tot_gen_fc, load_fc, imp_price, exp_price, soc, bat_cap, pv_cap)
-            lb, ub = ems.get_bounds()
-            optimizer = IAROA(ems.fitness_function, max_iter=15, lb=lb, ub=ub, n_agents=8)
-            best_sol, best_fit, _ = optimizer.optimize()
-
-            P_ch_iora = float(best_sol[0])
-            P_dis_iora = float(best_sol[H])
-            net_iora = load_now + P_ch_iora - tot_gen_now - P_dis_iora
-            P_imp_iora = max(0.0, net_iora)
-            P_exp_iora = max(0.0, -net_iora)
-
-            cost_iora, carbon_iora = _compute_cost_carbon(
-                curr_imp_p, curr_exp_p, P_imp_iora, P_exp_iora, P_dis_iora
-            )
-            comp_ms_iora = float(optimizer.time_taken * 1000.0)
-
-            iora_hour["per_city"][cid] = {
-                "city": cfg["name"],
-                "cost_inr": round(cost_iora, 2),
-                "carbon_kg": round(carbon_iora, 2),
-                "import_kw": round(P_imp_iora, 2),
-                "export_kw": round(P_exp_iora, 2),
-                "computation_ms": round(comp_ms_iora, 1),
+            c_res = {
+                "gen_now": gen_now, "load_now": load_now,
+                "pv_now": float(pv[0]), "wind_now": float(wind[0]),
+                "thermal_now": float(therm[0]),
+                "surplus": float(round(max(0.0, gen_now - load_now), 2)),
+                "deficit": float(round(max(0.0, load_now - gen_now), 2)),
+                "net_kw": round(gen_now - load_now, 2),
+                "temp_c": round(float(wx["temps"][hour_idx % len(wx["temps"])]), 1),
+                "wind_mps": round(float(wx["winds"][hour_idx % len(wx["winds"])]), 1),
+                "soc_pct": round(new_soc / bat_cap * 100, 1),
+                "soh": round(new_soh, 4), "cycles": round(sim_cycles[cid], 2),
             }
-            iora_hour["total_cost_inr"] = float(iora_hour["total_cost_inr"]) + cost_iora
-            iora_hour["total_carbon_kg"] = float(iora_hour["total_carbon_kg"]) + carbon_iora
-            iora_hour["total_computation_ms"] = float(iora_hour["total_computation_ms"]) + comp_ms_iora
-
-            # ---- IAROA + MPC ----
-            ems2 = MicrogridEMS(tot_gen_fc, load_fc, imp_price, exp_price, soc, bat_cap, pv_cap)
-            lb2, ub2 = ems2.get_bounds()
-            optimizer2 = IAROA(ems2.fitness_function, max_iter=15, lb=lb2, ub=ub2, n_agents=8)
-            _, _, _ = optimizer2.optimize()
-
-            avg_price = float(np.mean(imp_price))
-            P_ch_mpc, P_dis_mpc, P_imp_mpc, P_exp_mpc = mpc_dispatch(
-                tot_gen_now, load_now, soc, curr_imp_p, curr_exp_p, avg_price, bat_cap
-            )
-            comp_ms_mpc = float(optimizer2.time_taken * 1000.0)
-
-            cost_mpc, carbon_mpc = _compute_cost_carbon(
-                curr_imp_p, curr_exp_p, P_imp_mpc, P_exp_mpc, P_dis_mpc
-            )
-
-            mpc_hour["per_city"][cid] = {
-                "city": cfg["name"],
-                "cost_inr": round(cost_mpc, 2),
-                "carbon_kg": round(carbon_mpc, 2),
-                "import_kw": round(P_imp_mpc, 2),
-                "export_kw": round(P_exp_mpc, 2),
-                "computation_ms": round(comp_ms_mpc, 1),
+            cluster_city_res[cfg["cluster"]][cid] = c_res
+            hour_data["cities"][cid] = {
+                "iaroa_cost": round(cost_i, 2), "mpc_cost": round(cost_m, 2),
+                "iaroa_carbon": round(carbon_i, 4), "mpc_carbon": round(carbon_m, 4),
+                "import_kw": round(Pimp_m, 2), "export_kw": round(Pexp_m, 2),
+                "charge_kw": round(Pch_m, 2), "discharge_kw": round(Pdis_m, 2),
+                "soc_pct": round(new_soc / bat_cap * 100, 1),
+                "soh": round(new_soh, 4),
+                **c_res,
+                **perf_cid,
+                "fitness": round(bfit, 2),
             }
-            mpc_hour["total_cost_inr"] = float(mpc_hour["total_cost_inr"]) + cost_mpc
-            mpc_hour["total_carbon_kg"] = float(mpc_hour["total_carbon_kg"]) + carbon_mpc
-            mpc_hour["total_computation_ms"] = float(mpc_hour["total_computation_ms"]) + comp_ms_mpc
+            hour_data["performance"][cid] = perf_cid
 
-            # FIX: Update simulation SOC (not live city_states)
-            eta_ch = float(OPTIMIZATION_SETTINGS["battery_eta_ch"])
-            eta_dis = float(OPTIMIZATION_SETTINGS["battery_eta_dis"])
-            new_soc = soc + eta_ch * P_ch_mpc - P_dis_mpc / eta_dis
-            sim_socs[cid] = max(0.2 * bat_cap, min(0.9 * bat_cap, new_soc))
+        t_reg = _time.perf_counter()
+        regional = {}
+        for cl in CLUSTERS:
+            regional[cl] = regional_mpc(cl, cluster_city_res[cl])
+        reg_ms = (_time.perf_counter() - t_reg) * 1000
+        
+        t_glob = _time.perf_counter()
+        global_res = global_mpc(regional)
+        glob_ms = (_time.perf_counter() - t_glob) * 1000
+        
+        total_ms += reg_ms + glob_ms
+        
+        hour_data["hierarchical"] = {
+            "local": {cid: {"Pch": d["charge_kw"], "Pdis": d["discharge_kw"]} for cid, d in hour_data["cities"].items()},
+            "regional": regional,
+            "global": global_res,
+            "regional_time_ms": round(reg_ms, 3),
+            "global_time_ms": round(glob_ms, 3),
+        }
+        hour_data["totals"] = {
+            "iaroa_cost": round(total_iaroa_cost, 2),
+            "mpc_cost": round(total_mpc_cost, 2),
+            "iaroa_carbon": round(total_iaroa_carbon, 4),
+            "mpc_carbon": round(total_mpc_carbon, 4),
+            "total_ms": round(total_ms, 1),
+        }
+        results.append(hour_data)
+    return {"simulation": results}
 
-        # P2P Trades for this hour
-        p2p_trades = compute_p2p_trades(city_opt_res)
+@app.post("/reset-states")
+def reset_states() -> Dict[str, str]:
+    _init_states()
+    WEATHER_CACHE.clear()
+    return {"status": "reset", "message": "All city states and weather cache cleared"}
 
-        # FIX: Round totals before appending
-        iora_hour["total_cost_inr"] = round(float(iora_hour["total_cost_inr"]), 2)
-        iora_hour["total_carbon_kg"] = round(float(iora_hour["total_carbon_kg"]), 2)
-        iora_hour["total_computation_ms"] = round(float(iora_hour["total_computation_ms"]), 1)
-        mpc_hour["total_cost_inr"] = round(float(mpc_hour["total_cost_inr"]), 2)
-        mpc_hour["total_carbon_kg"] = round(float(mpc_hour["total_carbon_kg"]), 2)
-        mpc_hour["total_computation_ms"] = round(float(mpc_hour["total_computation_ms"]), 1)
-
-        simulation_results.append({
-            "hour": hour_idx,
-            "iora_only": iora_hour,
-            "iora_mpc": mpc_hour,
-            "p2p_trades_mpc": p2p_trades,
-            "city_opt_results": city_opt_res,
-        })
-
-    return {"simulation": simulation_results}
-
-
-@app.get("/comparison")
-def get_comparison_summary() -> Dict[str, Any]:
-    """Quick endpoint for comparison data without re-running optimization."""
-    return {
-        "cities": list(CITIES.keys()),
-        "city_names": {cid: cfg["name"] for cid, cfg in CITIES.items()},
-        "city_states": city_states,
-        "communication_links": get_communication_links(),
-        "topology": "full_mesh",
-        "num_nodes": 5,
-        "num_links": 10,
-        "description": (
-            "Decentralized 5-city microgrid with peer-to-peer energy trading. "
-            "Each city runs IAROA metaheuristic and MPC dispatch independently."
-        ),
-    }
+@app.get("/battery-health")
+def battery_health() -> Dict[str, Any]:
+    out = {}
+    for cid, cfg in CITIES.items():
+        s = city_states[cid]
+        remaining_life_pct = max(0, (s["soh"] - 0.5) / 0.5 * 100)
+        out[cid] = {
+            "city": cfg["name"], "cluster": cfg["cluster"],
+            "soh": round(s["soh"], 4), "soh_pct": round(s["soh"] * 100, 2),
+            "cycles": round(s["cycles"], 2),
+            "remaining_life_pct": round(remaining_life_pct, 1),
+            "soc_kwh": round(s["soc_kwh"], 2),
+            "soc_pct": round(s["soc_kwh"] / cfg["bat_cap"] * 100, 1),
+            "bat_cap_kwh": cfg["bat_cap"],
+            "status": ("healthy" if s["soh"] > 0.85 else
+                       "degraded" if s["soh"] > 0.70 else "critical"),
+        }
+    return {"battery_health": out}
