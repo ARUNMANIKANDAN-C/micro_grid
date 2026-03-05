@@ -425,9 +425,9 @@ function WeatherPanel({ cityId, startDate, endDate }) {
                         <YAxis yAxisId="right" orientation="right" fontSize={9} stroke="#f59e0b" />
                         <Tooltip {...TOOLTIP_STYLE} />
                         <Legend wrapperStyle={{ fontSize: '0.7rem' }} />
-                        <Area yAxisId="left" type="monotone" dataKey="Solar" stroke="#fbbf24" fill="#fef9c3" strokeWidth={2} name="Solar(×10 W/m²)" />
-                        <Line yAxisId="left" type="monotone" dataKey="Temp" stroke="#ef4444" strokeWidth={2} dot={false} name="Temp(°C)" />
-                        <Line yAxisId="right" type="monotone" dataKey="Wind" stroke="#3b82f6" strokeWidth={2} dot={false} name="Wind(m/s)" />
+                        <Area isAnimationActive={false} yAxisId="left" type="monotone" dataKey="Solar" stroke="#fbbf24" fill="#fef9c3" strokeWidth={2} name="Solar(×10 W/m²)" />
+                        <Line isAnimationActive={false} yAxisId="left" type="monotone" dataKey="Temp" stroke="#ef4444" strokeWidth={2} dot={false} name="Temp(°C)" />
+                        <Line isAnimationActive={false} yAxisId="right" type="monotone" dataKey="Wind" stroke="#3b82f6" strokeWidth={2} dot={false} name="Wind(m/s)" />
                     </ComposedChart>
                 </ResponsiveContainer>
             </div>
@@ -512,8 +512,8 @@ function SimReport({ simData, date }) {
                                 </defs>
                                 <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" /><XAxis dataKey="h" fontSize={9} stroke="#94a3b8" /><YAxis fontSize={9} stroke="#94a3b8" />
                                 <Tooltip {...TOOLTIP_STYLE} /><Legend wrapperStyle={{ fontSize: '0.72rem' }} />
-                                <Area type="monotone" dataKey="IAROA" stroke="#d97706" fill="url(#gI)" strokeWidth={2} />
-                                <Area type="monotone" dataKey="MPC" stroke="#059669" fill="url(#gM)" strokeWidth={2} />
+                                <Area isAnimationActive={false} type="monotone" dataKey="IAROA" stroke="#d97706" fill="url(#gI)" strokeWidth={2} />
+                                <Area isAnimationActive={false} type="monotone" dataKey="MPC" stroke="#059669" fill="url(#gM)" strokeWidth={2} />
                             </AreaChart>
                         </ResponsiveContainer>
                     </div>
@@ -529,8 +529,8 @@ function SimReport({ simData, date }) {
                                 </defs>
                                 <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" /><XAxis dataKey="h" fontSize={9} stroke="#94a3b8" /><YAxis fontSize={9} stroke="#94a3b8" />
                                 <Tooltip {...TOOLTIP_STYLE} /><Legend wrapperStyle={{ fontSize: '0.72rem' }} />
-                                <Area type="monotone" dataKey="IAROA" stroke="#ef4444" fill="url(#gIC)" strokeWidth={2} />
-                                <Area type="monotone" dataKey="MPC" stroke="#7c3aed" fill="url(#gMC)" strokeWidth={2} />
+                                <Area isAnimationActive={false} type="monotone" dataKey="IAROA" stroke="#ef4444" fill="url(#gIC)" strokeWidth={2} />
+                                <Area isAnimationActive={false} type="monotone" dataKey="MPC" stroke="#7c3aed" fill="url(#gMC)" strokeWidth={2} />
                             </AreaChart>
                         </ResponsiveContainer>
                     </div>
@@ -542,8 +542,8 @@ function SimReport({ simData, date }) {
                             <ComposedChart data={genData}>
                                 <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" /><XAxis dataKey="h" fontSize={9} stroke="#94a3b8" /><YAxis fontSize={9} stroke="#94a3b8" />
                                 <Tooltip {...TOOLTIP_STYLE} /><Legend wrapperStyle={{ fontSize: '0.72rem' }} />
-                                <Area type="monotone" dataKey="Generation" stroke="#059669" fill="#d1fae5" strokeWidth={2} />
-                                <Line type="monotone" dataKey="Load" stroke="#ef4444" strokeWidth={2} strokeDasharray="5 3" dot={false} />
+                                <Area isAnimationActive={false} type="monotone" dataKey="Generation" stroke="#059669" fill="#d1fae5" strokeWidth={2} />
+                                <Line isAnimationActive={false} type="monotone" dataKey="Load" stroke="#ef4444" strokeWidth={2} strokeDasharray="5 3" dot={false} />
                             </ComposedChart>
                         </ResponsiveContainer>
                     </div>
@@ -555,7 +555,7 @@ function SimReport({ simData, date }) {
                             <LineChart data={socData}>
                                 <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" /><XAxis dataKey="h" fontSize={9} stroke="#94a3b8" /><YAxis domain={[0, 100]} fontSize={9} stroke="#94a3b8" />
                                 <Tooltip {...TOOLTIP_STYLE} /><Legend wrapperStyle={{ fontSize: '0.68rem' }} />
-                                {cityIds.map(c => <Line key={c} type="monotone" dataKey={CITY_META[c]?.name || c} stroke={CITY_COLORS[CITY_META[c]?.name] || '#888'} strokeWidth={1.5} dot={false} />)}
+                                {cityIds.map(c => <Line isAnimationActive={false} key={c} type="monotone" dataKey={CITY_META[c]?.name || c} stroke={CITY_COLORS[CITY_META[c]?.name] || '#888'} strokeWidth={1.5} dot={false} />)}
                             </LineChart>
                         </ResponsiveContainer>
                     </div>
@@ -567,7 +567,7 @@ function SimReport({ simData, date }) {
                             <LineChart data={sohData}>
                                 <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" /><XAxis dataKey="h" fontSize={9} stroke="#94a3b8" /><YAxis domain={[98, 101]} fontSize={9} stroke="#94a3b8" />
                                 <Tooltip {...TOOLTIP_STYLE} /><Legend wrapperStyle={{ fontSize: '0.68rem' }} />
-                                {cityIds.map(c => <Line key={c} type="monotone" dataKey={CITY_META[c]?.name || c} stroke={CITY_COLORS[CITY_META[c]?.name] || '#888'} strokeWidth={1.5} dot={false} />)}
+                                {cityIds.map(c => <Line isAnimationActive={false} key={c} type="monotone" dataKey={CITY_META[c]?.name || c} stroke={CITY_COLORS[CITY_META[c]?.name] || '#888'} strokeWidth={1.5} dot={false} />)}
                             </LineChart>
                         </ResponsiveContainer>
                     </div>
@@ -579,7 +579,7 @@ function SimReport({ simData, date }) {
                             <BarChart data={perfData}>
                                 <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" /><XAxis dataKey="h" fontSize={9} stroke="#94a3b8" /><YAxis fontSize={9} stroke="#94a3b8" />
                                 <Tooltip {...TOOLTIP_STYLE} /><Legend wrapperStyle={{ fontSize: '0.72rem' }} />
-                                <Bar dataKey="Opt Time(ms)" fill="#6366f1" radius={[3, 3, 0, 0]} />
+                                <Bar isAnimationActive={false} dataKey="Opt Time(ms)" fill="#6366f1" radius={[3, 3, 0, 0]} />
                             </BarChart>
                         </ResponsiveContainer>
                     </div>
