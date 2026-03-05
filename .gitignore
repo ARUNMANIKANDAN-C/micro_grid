@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+ems_venv/
+venv/
+.venv/
+env/
+*.egg-info/
+*.egg
+
+# Environment variables
+.env
+
+# Node.js
+node_modules/
+ems-web/node_modules/
+ems-web/dist/
+dist/
+build/
+.npm
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Caches and Logs
+*.log
+.cache.sqlite
+.ems_settings.json
+.eslintcache
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo

@@ -1,0 +1,68 @@
+================================================================================
+DATA PREPROCESSING SUMMARY
+================================================================================
+
+Original dataset shape: (8784, 22)
+Cleaned dataset shape: (8784, 22)
+Date range: 2020-01-01 00:00:00 to 2020-12-31 23:00:00
+
+Missing values in original data:
+Year                                      0
+Month                                     0
+Day                                       0
+Hour                                      0
+Minute                                    0
+Temperature                               0
+Clearsky DHI                              0
+Clearsky DNI                              0
+Clearsky GHI                              0
+Cloud Type                                0
+DHI                                       0
+DNI                                       0
+Fill Flag                                 0
+GHI                                       0
+Relative Humidity                         0
+Solar Zenith Angle                     4569
+Solar Azimuth Angle                       0
+Panel Tilt                             4368
+Panel Azimuth Angle                       0
+Cloud_Effect_Ratio                     4417
+DNI_DHI_Ratio                          4417
+Temperature_Category                      0
+dtype: int64
+
+Data types:
+Year                                      int64
+Month                                     int32
+Day                                       int64
+Hour                                      int32
+Minute                                    int64
+Temperature                             float64
+Clearsky DHI                              int64
+Clearsky DNI                              int64
+Clearsky GHI                              int64
+Cloud Type                                int64
+DHI                                       int64
+DNI                                       int64
+Fill Flag                                 int64
+GHI                                       int64
+Relative Humidity                       float64
+Solar Zenith Angle                      float64
+Solar Azimuth Angle                     float64
+Panel Tilt                              float64
+Panel Azimuth Angle                      object
+Cloud_Effect_Ratio                      float64
+DNI_DHI_Ratio                           float64
+Temperature_Category                   category
+dtype: object
+
+Sample of cleaned data (first 5 rows):
+                     Year  Month  ...  DNI_DHI_Ratio  Temperature_Category
+Datetime                          ...                                     
+2020-01-01 00:00:00  2020      1  ...            NaN                  Cool
+2020-01-01 01:00:00  2020      1  ...            NaN                  Cool
+2020-01-01 02:00:00  2020      1  ...       4.320000                  Cool
+2020-01-01 03:00:00  2020      1  ...       0.007194                  Warm
+2020-01-01 04:00:00  2020      1  ...       6.072581                  Warm
+
+[5 rows x 22 columns]

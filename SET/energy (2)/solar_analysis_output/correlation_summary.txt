@@ -1,0 +1,30 @@
+================================================================================
+CORRELATION ANALYSIS SUMMARY
+================================================================================
+
+Top 10 Positive Correlations:
+========================================
+GHI - Clearsky GHI: 0.948
+Clearsky GHI - GHI: 0.948
+Clearsky GHI - DHI: 0.895
+DHI - Clearsky GHI: 0.895
+DNI - GHI: 0.873
+GHI - DNI: 0.873
+GHI - DHI: 0.819
+DHI - GHI: 0.819
+Cloud_Effect_Ratio - DNI: 0.752
+DNI - Cloud_Effect_Ratio: 0.752
+
+========================================
+Top 10 Negative Correlations:
+========================================
+Clearsky GHI - Solar Zenith Angle: -0.981
+Solar Zenith Angle - Clearsky GHI: -0.981
+Relative Humidity - Temperature: -0.927
+Temperature - Relative Humidity: -0.927
+Solar Zenith Angle - GHI: -0.859
+GHI - Solar Zenith Angle: -0.859
+DHI - Solar Zenith Angle: -0.777
+Solar Zenith Angle - DHI: -0.777
+GHI - Relative Humidity: -0.729
+Relative Humidity - GHI: -0.729
