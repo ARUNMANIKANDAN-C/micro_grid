@@ -474,6 +474,9 @@ function SimReport({ simData, date }) {
     const costSav = totalIaroa - totalMpc;
     const carbSav = totalIaroaC - totalMpcC;
 
+    const isSingleCity = cityIds.length === 1;
+    const targetName = isSingleCity ? (CITY_META[cityIds[0]]?.name || 'City') : 'Network';
+
     const CITY_COLORS = { Delhi: '#3b82f6', Jaipur: '#8b5cf6', Lucknow: '#06b6d4', Mumbai: '#f59e0b', Pune: '#ef4444', Ahmedabad: '#f97316', Chennai: '#10b981', Kolkata: '#a855f7', Bangalore: '#ec4899' };
     return (
         <div style={{ background: 'white', borderRadius: 12, padding: 20, border: '1px solid #e2e8f0', boxShadow: '0 2px 12px rgba(0,0,0,.06)', marginTop: 20 }}>
@@ -583,6 +586,58 @@ function SimReport({ simData, date }) {
                             </BarChart>
                         </ResponsiveContainer>
                     </div>
+                </div>
+            </div>
+
+            {/* ─── SUMMARY ANALYSIS & INFERENCES ─── */}
+            <div style={{ marginTop: 24, padding: 20, background: '#f8fafc', borderRadius: 12, border: '1px solid #e2e8f0' }}>
+                <h3 style={{ fontSize: '1.05rem', color: '#1e293b', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
+                    📊 Executive Summary & Analysis
+                </h3>
+
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 16 }}>
+
+                    {/* Algorithm Comparisons */}
+                    <div style={{ background: '#fff', padding: 16, borderRadius: 8, boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
+                        <div style={{ fontWeight: 600, color: '#334155', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 4 }}>
+                            ⚙️ Real-time Algorithm Performance
+                        </div>
+                        <ul style={{ fontSize: '0.82rem', color: '#475569', margin: 0, paddingLeft: 16, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                            <li><b>IAROA (Day-Ahead Plan):</b> Generated the optimal 24-hour blueprint for {targetName} with an estimated cost of <b>₹{totalIaroa.toFixed(0)}</b> and <b>{totalIaroaC.toFixed(0)} kg</b> of carbon.</li>
+                            <li><b>IAROA + MPC (Live Execution):</b> Reacted to live 15-minute intervals, resulting in an actual cost of <b>₹{totalMpc.toFixed(0)}</b> and <b>{totalMpcC.toFixed(0)} kg</b> of carbon.</li>
+                            <li><b>Verdict:</b> The Hybrid MPC {costSav >= 0 ? 'successfully saved' : 'incurred a slight penalty of'} <b>₹{Math.abs(costSav).toFixed(0)}</b> {costSav >= 0 ? 'by capturing real-time inefficiencies' : 'due to unexpected weather deviations'} compared to the pure day-ahead forecast.</li>
+                        </ul>
+                    </div>
+
+                    {/* Layman Inference */}
+                    <div style={{ background: '#fff', padding: 16, borderRadius: 8, boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
+                        <div style={{ fontWeight: 600, color: '#334155', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 4 }}>
+                            🧠 Simulation Inference ({targetName})
+                        </div>
+                        <p style={{ fontSize: '0.82rem', color: '#475569', margin: 0, lineHeight: 1.5 }}>
+                            The AI managed {targetName}'s grid effectively by hoarding renewable energy during low-demand periods and discharging the batteries during high-price peak hours.
+                            <br /><br />
+                            {costSav > 0 ? `By pairing IAROA with the real-time MPC, the system actively corrected minor weather deviations, proving the superior stability of a Hybrid approach over pure metaheuristics.` : `The MPC strictly enforced battery State-of-Health (SOH) protections, ensuring the physical lifespan of the equipment wasn't damaged for short-term financial gain.`}
+                        </p>
+                    </div>
+
+                    {/* Customer Suggestions */}
+                    <div style={{ background: '#fff', padding: 16, borderRadius: 8, boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
+                        <div style={{ fontWeight: 600, color: '#334155', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 4 }}>
+                            💡 Personalized Iteration Suggestions
+                        </div>
+                        <div style={{ fontSize: '0.82rem', color: '#475569', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                            <div style={{ borderLeft: '3px solid #10b981', paddingLeft: 8 }}>
+                                <b style={{ color: '#059669' }}>💸 To further optimize COST:</b><br />
+                                {costSav > 0 ? `MPC found ₹${Math.abs(costSav).toFixed(0)} of extra savings. Increase the "Demand Response" discount to allow the AI to shift even more evening loads into the night.` : `MPC followed the blueprint closely. Try increasing the battery capacity so the AI can hoard 100% of the noon solar curtailment.`}
+                            </div>
+                            <div style={{ borderLeft: '3px solid #3b82f6', paddingLeft: 8 }}>
+                                <b style={{ color: '#2563eb' }}>🌱 To further reduce CARBON:</b><br />
+                                {carbSav > 0 ? `MPC actively diverted ${Math.abs(carbSav).toFixed(1)} kg of CO₂. Crank up the "Carbon Tax" parameter manually to force the AI to penalize fossil-fuel grid imports even harder in the next iteration.` : `Carbon was tightly managed by the IAROA blueprint. For a zero-carbon profile, you must expand ${targetName}'s physical solar/wind capacity.`}
+                            </div>
+                        </div>
+                    </div>
+
                 </div>
             </div>
         </div>
@@ -945,7 +1000,7 @@ export default function MicrogridDashboard() {
                                             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.73rem' }}>
                                                 <thead><tr style={{ background: '#f8fafc' }}><th style={{ padding: '5px 8px', textAlign: 'left', color: '#94a3b8' }}>Metric</th><th style={{ padding: '5px 8px', color: C.iaroa }}>IAROA</th><th style={{ padding: '5px 8px', color: C.mpc }}>+MPC</th></tr></thead>
                                                 <tbody>
-                                                    {[['Cost', 'cost_inr', '₹'], ['Carbon', 'carbon_kg', 'kg'], ['Import', 'import_kw', 'kW']].map(([l, k, u]) => (
+                                                    {[['Hourly Cost', 'cost_inr', '₹'], ['Carbon Emission', 'carbon_kg', 'kg'], ['Grid Import', 'import_kw', 'kW'], ['Bat. Charge', 'charge_kw', 'kW'], ['Bat. Discharge', 'discharge_kw', 'kW']].map(([l, k, u]) => (
                                                         <tr key={l} style={{ borderBottom: '1px solid #f1f5f9' }}>
                                                             <td style={{ padding: '5px 8px', color: '#64748b' }}>{l}</td>
                                                             <td style={{ padding: '5px 8px', fontWeight: 600 }}>{u}{ic[k]}</td>

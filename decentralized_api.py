@@ -264,7 +264,7 @@ def _fetch_openmeteo(lat: float, lon: float, start_date: str, end_date: str,
                  "shortwave_radiation","cloud_cover","precipitation"]
         params: Dict[str, Any] = {
             "latitude": lat, "longitude": lon,
-            "hourly": hvars,
+            "hourly": hvars, "timezone": "Asia/Kolkata"
         }
         if mode == "archive":
             params["start_date"] = start_date
